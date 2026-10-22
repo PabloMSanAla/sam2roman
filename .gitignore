@@ -1,0 +1,63 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments & Conda
+.venv
+venv/
+ENV/
+env/
+.conda/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# Pytest & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Hugging Face and model weights
+.cache/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+
+# Data files (keep sample_data scripts, exclude large downloaded FITS)
+*.fits
+*.fits.gz
+*.fit
+*.fts
+!tutorials/sample_data/sample_roman_wfi.fits
+
+# OS artifacts
+.DS_Store
+Thumbs.db
