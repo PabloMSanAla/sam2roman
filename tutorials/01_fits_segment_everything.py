@@ -32,6 +32,7 @@ def main():
     # 1. Locate or create sample FITS file
     base_dir = Path(__file__).resolve().parent
     fits_path = base_dir / "sample_data" / "sample_roman_wfi.fits"
+    fits_path = Path('/Users/pmsanch1/storage/ROMAN/comissioning/PID1083/detectors/fits/r0108301001001001001_WFI3.fits')
 
     if not fits_path.exists():
         print(f"\n[Step 1] Sample FITS not found at {fits_path.name}. Generating synthetic field...")

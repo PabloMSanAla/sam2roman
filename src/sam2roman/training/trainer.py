@@ -5,10 +5,11 @@ Training and fine-tuning engine for SAM 2 on astronomical datasets.
 from __future__ import annotations
 
 import logging
-import os
+import time
 from pathlib import Path
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -38,6 +39,8 @@ class SAM2Trainer:
         Weight decay for AdamW.
     freeze_vision_encoder : bool, default True
         Whether to freeze the heavy vision backbone.
+    prompt_type : str, default 'point'
+        Type of prompt used during training: 'point' or 'box'.
     device : str or torch.device, optional
         Target device ('cuda', 'mps', 'cpu').
     """
@@ -49,6 +52,7 @@ class SAM2Trainer:
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-4,
         freeze_vision_encoder: bool = True,
+        prompt_type: str = "point",
         device: Optional[Union[str, torch.device]] = None,
     ):
         if model_wrapper is not None:
@@ -60,14 +64,15 @@ class SAM2Trainer:
         self.model = self.model_wrapper.model
         self.processor = self.model_wrapper.processor
         self.freeze_vision_encoder = freeze_vision_encoder
+        self.prompt_type = prompt_type
 
         if self.freeze_vision_encoder:
             self._freeze_encoder()
 
-        # Gather trainable parameters
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        # Trainable parameters
+        self.trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
-            trainable_params,
+            self.trainable_params,
             lr=learning_rate,
             weight_decay=weight_decay,
         )
@@ -79,7 +84,6 @@ class SAM2Trainer:
         trainable_count = 0
 
         for name, param in self.model.named_parameters():
-            # Freeze vision encoder / backbone
             if "image_encoder" in name or "vision_encoder" in name or "backbone" in name:
                 param.requires_grad = False
                 frozen_count += 1
@@ -88,47 +92,92 @@ class SAM2Trainer:
                 trainable_count += 1
 
         logger.info(
-            f"Encoder frozen: {frozen_count} tensors frozen, {trainable_count} tensors trainable."
+            f"Vision backbone frozen: {frozen_count} tensors frozen, {trainable_count} tensors trainable."
         )
 
     def train_epoch(self, dataloader: DataLoader) -> float:
-        """
-        Execute one training epoch.
-
-        Parameters
-        ----------
-        dataloader : DataLoader
-            Batch provider for AstronomicalDataset.
-
-        Returns
-        -------
-        float
-            Mean epoch loss.
-        """
+        """Execute one training epoch."""
         self.model.train()
         total_loss = 0.0
         steps = 0
 
-        pbar = tqdm(dataloader, desc="Training Epoch", leave=False)
-        for batch in pbar:
+        for batch in dataloader:
             images = batch["pil_image"]
             target_masks = batch["mask"].to(self.device)  # (B, 1, H, W)
-            points = batch["point"].unsqueeze(1).tolist()  # (B, 1, 1, 2)
-            labels = batch["point_label"].unsqueeze(1).tolist()
 
-            try:
-                inputs = self.processor(
+            if self.prompt_type == "box":
+                boxes = batch["box"].unsqueeze(1).tolist()  # (B, 1, 4)
+                proc_inputs = self.processor(
+                    images=images,
+                    input_boxes=boxes,
+                    return_tensors="pt",
+                ).to(self.device)
+            else:
+                points = batch["point"].unsqueeze(1).tolist()  # (B, 1, 1, 2)
+                labels = batch["point_label"].unsqueeze(1).tolist()
+                proc_inputs = self.processor(
                     images=images,
                     input_points=points,
                     input_labels=labels,
                     return_tensors="pt",
                 ).to(self.device)
 
-                self.optimizer.zero_grad()
-                outputs = self.model(**inputs)
+            self.optimizer.zero_grad()
+            outputs = self.model(**proc_inputs)
 
-                pred_logits = outputs.pred_masks[:, 0, 0:1, :, :]  # Leading prompt mask logit
-                # Resize pred_logits to match target mask dimensions if necessary
+            pred_logits = outputs.pred_masks[:, 0, 0:1, :, :]
+            if pred_logits.shape[-2:] != target_masks.shape[-2:]:
+                pred_logits = nn.functional.interpolate(
+                    pred_logits,
+                    size=target_masks.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            loss = self.criterion(pred_logits, target_masks)
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item()
+            steps += 1
+
+        return total_loss / max(1, steps)
+
+    def evaluate(self, dataloader: DataLoader) -> Tuple[float, float]:
+        """
+        Evaluate on validation dataset.
+        Returns (mean_val_loss, mean_val_iou).
+        """
+        self.model.eval()
+        total_loss = 0.0
+        total_iou = 0.0
+        steps = 0
+
+        with torch.no_grad():
+            for batch in dataloader:
+                images = batch["pil_image"]
+                target_masks = batch["mask"].to(self.device)
+
+                if self.prompt_type == "box":
+                    boxes = batch["box"].unsqueeze(1).tolist()
+                    proc_inputs = self.processor(
+                        images=images,
+                        input_boxes=boxes,
+                        return_tensors="pt",
+                    ).to(self.device)
+                else:
+                    points = batch["point"].unsqueeze(1).tolist()
+                    labels = batch["point_label"].unsqueeze(1).tolist()
+                    proc_inputs = self.processor(
+                        images=images,
+                        input_points=points,
+                        input_labels=labels,
+                        return_tensors="pt",
+                    ).to(self.device)
+
+                outputs = self.model(**proc_inputs)
+                pred_logits = outputs.pred_masks[:, 0, 0:1, :, :]
+
                 if pred_logits.shape[-2:] != target_masks.shape[-2:]:
                     pred_logits = nn.functional.interpolate(
                         pred_logits,
@@ -138,18 +187,18 @@ class SAM2Trainer:
                     )
 
                 loss = self.criterion(pred_logits, target_masks)
-                loss.backward()
-                self.optimizer.step()
+                total_loss += loss.item()
 
-                loss_val = loss.item()
-                total_loss += loss_val
+                # Calculate IoU metric
+                pred_binary = (pred_logits > 0.0).float()
+                target_binary = (target_masks > 0.0).float()
+                intersection = (pred_binary * target_binary).sum(dim=(-1, -2))
+                union = pred_binary.sum(dim=(-1, -2)) + target_binary.sum(dim=(-1, -2)) - intersection
+                iou = (intersection + 1e-6) / (union + 1e-6)
+                total_iou += iou.mean().item()
                 steps += 1
-                pbar.set_postfix({"loss": f"{loss_val:.4f}"})
-            except Exception as e:
-                logger.warning(f"Error in training step: {e}")
-                continue
 
-        return total_loss / max(1, steps)
+        return total_loss / max(1, steps), total_iou / max(1, steps)
 
     def train(
         self,
@@ -158,6 +207,7 @@ class SAM2Trainer:
         batch_size: int = 2,
         val_dataset: Optional[AstronomicalDataset] = None,
         output_dir: Optional[Union[str, Path]] = None,
+        verbose: bool = True,
     ) -> Dict[str, Any]:
         """
         Run the complete fine-tuning routine.
@@ -174,6 +224,8 @@ class SAM2Trainer:
             Optional validation dataset.
         output_dir : str or Path, optional
             Directory to save checkpoints.
+        verbose : bool, default True
+            Print progress and metrics per epoch.
         """
         def collate_fn(batch):
             return {
@@ -185,19 +237,59 @@ class SAM2Trainer:
                 "point_label": torch.stack([b["point_label"] for b in batch]),
             }
 
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-        history = {"train_loss": []}
+        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+        val_loader = (
+            DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+            if val_dataset is not None
+            else None
+        )
 
-        logger.info(f"Starting fine-tuning for {epochs} epochs on {self.device}...")
+        history: Dict[str, List[float]] = {
+            "train_loss": [],
+            "val_loss": [],
+            "val_iou": [],
+        }
+
+        best_val_loss = float("inf")
+
+        if verbose:
+            print(f"[sam2roman] Starting fine-tuning for {epochs} epochs on {self.device}...")
+            print(f"  -> Trainable parameters: {sum(p.numel() for p in self.trainable_params):,}")
+            print(f"  -> Training samples:     {len(dataset)}")
+            if val_dataset:
+                print(f"  -> Validation samples:   {len(val_dataset)}")
+            print("-" * 65)
+
         for epoch in range(1, epochs + 1):
-            avg_loss = self.train_epoch(dataloader)
-            history["train_loss"].append(avg_loss)
-            logger.info(f"Epoch [{epoch}/{epochs}] - Loss: {avg_loss:.4f}")
+            t0 = time.time()
+            train_loss = self.train_epoch(train_loader)
+            history["train_loss"].append(train_loss)
+            elapsed = time.time() - t0
 
+            val_str = ""
+            if val_loader is not None:
+                val_loss, val_iou = self.evaluate(val_loader)
+                history["val_loss"].append(val_loss)
+                history["val_iou"].append(val_iou)
+                val_str = f" | Val Loss: {val_loss:.4f} | Val IoU: {val_iou:.4f}"
+
+                # Save best checkpoint
+                if output_dir and val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_path = Path(output_dir) / "checkpoint_best.pt"
+                    self.save_checkpoint(best_path)
+
+            if verbose:
+                print(f"Epoch [{epoch:02d}/{epochs:02d}] - Train Loss: {train_loss:.4f}{val_str} ({elapsed:.1f}s)")
+
+            # Save epoch checkpoint
             if output_dir:
                 save_path = Path(output_dir) / f"checkpoint_epoch_{epoch}.pt"
-                save_path.parent.mkdir(parents=True, exist_ok=True)
                 self.save_checkpoint(save_path)
+
+        if verbose:
+            print("-" * 65)
+            print("[sam2roman] Fine-tuning completed successfully!")
 
         return history
 
@@ -213,4 +305,13 @@ class SAM2Trainer:
             },
             path,
         )
-        logger.info(f"Checkpoint saved to: {path}")
+
+    def load_checkpoint(self, path: Union[str, Path]) -> None:
+        """Load model weights from checkpoint."""
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint not found at: {path}")
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.to(self.device)
+        logger.info(f"Loaded checkpoint from: {path}")

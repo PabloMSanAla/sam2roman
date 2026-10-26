@@ -30,10 +30,12 @@ class AstronomicalDataset(Dataset):
         List of 2D binary masks or multi-object segmentation maps (integer labeled).
     stretch_type : str, default 'asinh'
         Astronomical stretch for FITS conversion.
-    prompt_type : str, default 'box'
-        Type of training prompt to generate: 'box', 'point', or 'both'.
+    prompt_type : str, default 'point'
+        Type of training prompt: 'point', 'box', or 'both'.
+    box_jitter_pct : float, default 0.05
+        Fraction of box size to randomly jitter coordinates to build model robustness.
     transform : callable, optional
-        Optional augmentations (e.g. torchvision transforms).
+        Optional augmentations.
     """
 
     def __init__(
@@ -41,7 +43,8 @@ class AstronomicalDataset(Dataset):
         images: List[Union[str, Path, np.ndarray, FITSImage]],
         masks: List[np.ndarray],
         stretch_type: str = "asinh",
-        prompt_type: str = "box",
+        prompt_type: str = "point",
+        box_jitter_pct: float = 0.05,
         transform: Optional[Any] = None,
     ):
         if len(images) != len(masks):
@@ -51,10 +54,74 @@ class AstronomicalDataset(Dataset):
         self.masks = masks
         self.stretch_type = stretch_type
         self.prompt_type = prompt_type
+        self.box_jitter_pct = box_jitter_pct
         self.transform = transform
 
     def __len__(self) -> int:
         return len(self.images)
+
+    @classmethod
+    def from_single_fits_tiled(
+        cls,
+        fits_image: Union[FITSImage, np.ndarray, str, Path],
+        segmap: np.ndarray,
+        tile_size: int = 512,
+        stride: int = 384,
+        min_objects: int = 1,
+        stretch_type: str = "asinh",
+        prompt_type: str = "point",
+    ) -> "AstronomicalDataset":
+        """
+        Create a multi-sample dataset from ONE single large astronomical FITS image and segmap
+        by slicing it into overlapping tiles/cutouts (e.g. 512x512).
+
+        Parameters
+        ----------
+        fits_image : FITSImage, np.ndarray, or Path
+            The single master FITS image (e.g. 4088x4088 Roman WFI image).
+        segmap : np.ndarray
+            Matching 2D integer labeled segmentation map (0=bg, >0=object_id).
+        tile_size : int, default 512
+            Width and height of each training cutout.
+        stride : int, default 384
+            Step size between cutouts.
+        min_objects : int, default 1
+            Minimum number of discrete objects required to retain a tile.
+        """
+        if isinstance(fits_image, (str, Path)):
+            raw_data = FITSImage.from_file(fits_image).data
+        elif isinstance(fits_image, FITSImage):
+            raw_data = fits_image.data
+        else:
+            raw_data = np.asarray(fits_image, dtype=np.float32)
+
+        h, w = raw_data.shape
+        tiles_img = []
+        tiles_mask = []
+
+        for y in range(0, h - tile_size + 1, stride):
+            for x in range(0, w - tile_size + 1, stride):
+                patch_img = raw_data[y : y + tile_size, x : x + tile_size]
+                patch_mask = segmap[y : y + tile_size, x : x + tile_size]
+
+                unique_objs = np.unique(patch_mask)
+                unique_objs = unique_objs[unique_objs > 0]
+                if len(unique_objs) >= min_objects:
+                    tiles_img.append(patch_img)
+                    tiles_mask.append(patch_mask)
+
+        # Fallback if no tiles passed filter: take center crop
+        if not tiles_img:
+            cy, cx = h // 2, w // 2
+            tiles_img.append(raw_data[cy - tile_size // 2 : cy + tile_size // 2, cx - tile_size // 2 : cx + tile_size // 2])
+            tiles_mask.append(segmap[cy - tile_size // 2 : cy + tile_size // 2, cx - tile_size // 2 : cx + tile_size // 2])
+
+        return cls(
+            images=tiles_img,
+            masks=tiles_mask,
+            stretch_type=stretch_type,
+            prompt_type=prompt_type,
+        )
 
     def _load_image_array(self, idx: int) -> np.ndarray:
         item = self.images[idx]
@@ -78,7 +145,7 @@ class AstronomicalDataset(Dataset):
         rgb_3ch = np.stack([rgb_uint8, rgb_uint8, rgb_uint8], axis=-1)
         pil_image = Image.fromarray(rgb_3ch, mode="RGB")
 
-        # If mask is multi-object (>1 unique non-zero values), pick one random object for prompt-based training
+        # Pick one object from the mask for prompt-target training
         unique_labels = np.unique(raw_mask)
         unique_labels = unique_labels[unique_labels > 0]
 
@@ -89,21 +156,34 @@ class AstronomicalDataset(Dataset):
             target_mask = (raw_mask > 0).astype(np.float32)
 
         ys, xs = np.where(target_mask > 0)
+        h, w = raw_data.shape
+
         if len(xs) > 0:
             x_min, x_max = float(np.min(xs)), float(np.max(xs))
             y_min, y_max = float(np.min(ys)), float(np.max(ys))
-            # Random foreground point prompt
+
+            # Sample point prompt from object foreground
             pt_idx = np.random.randint(0, len(xs))
             point = [float(xs[pt_idx]), float(ys[pt_idx])]
             label = 1
+
+            # Bounding box with optional small jitter
+            bw = max(x_max - x_min, 1.0)
+            bh = max(y_max - y_min, 1.0)
+            if self.box_jitter_pct > 0.0:
+                jx = (np.random.rand() * 2 - 1) * bw * self.box_jitter_pct
+                jy = (np.random.rand() * 2 - 1) * bh * self.box_jitter_pct
+                x_min = max(0.0, x_min + jx)
+                x_max = min(float(w), x_max + jx)
+                y_min = max(0.0, y_min + jy)
+                y_max = min(float(h), y_max + jy)
+            box = [x_min, y_min, x_max, y_max]
         else:
-            # Empty fallback
-            h, w = raw_data.shape
+            # Fallback
             x_min, y_min, x_max, y_max = 0.0, 0.0, float(w), float(h)
             point = [float(w // 2), float(h // 2)]
             label = 0
-
-        box = [x_min, y_min, x_max, y_max]
+            box = [x_min, y_min, x_max, y_max]
 
         # Convert to tensors
         image_tensor = torch.from_numpy(rgb_3ch).permute(2, 0, 1).float() / 255.0
