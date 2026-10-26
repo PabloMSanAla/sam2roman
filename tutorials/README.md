@@ -11,7 +11,7 @@ Interactive walkthroughs and reproducible examples for running and fine-tuning M
 - **Key Concepts**:
   1. Reading FITS images and WCS headers (RA, Dec) with `sam2roman.io.FITSImage`.
   2. Preserving high dynamic range using non-linear `asinh` stretching.
-  3. Running high-performance automatic mask generation ("segment everything") with `verbose=True`.
+  3. High-performance single-pass automatic mask generation ("segment everything") with `verbose=True`.
   4. Decoupled astronomical source photometry (integrated flux, SNR, peak, half-light radius).
   5. Generating diagnostic summary plots and exporting labeled masks to multi-extension FITS.
 
@@ -21,11 +21,21 @@ Interactive walkthroughs and reproducible examples for running and fine-tuning M
 - **Files**: Notebook ([`02_training_sam2_fits.ipynb`](02_training_sam2_fits.ipynb)) and CLI script ([`02_training_sam2_fits.py`](02_training_sam2_fits.py))
 - **Key Concepts**:
   1. **What things you need**: FITS images, integer labeled ground-truth segmaps, prompt pairs, pretrained weights, accelerator.
-  2. **Expected formats**: Tiling a single large master FITS image (e.g. 4088x4088) into overlapping $512\times 512$ cutouts using `AstronomicalDataset.from_single_fits_tiled()`.
+  2. **Single Master Tiling**: Slicing 1 large master FITS image (e.g. 4088x4088) into overlapping $512\times 512$ cutouts with `AstronomicalDataset.from_single_fits_tiled()`.
   3. **Organization of training**: Freezing the Hiera vision backbone, training the prompt encoder and mask decoder with Combined BCE + Dice loss.
-  4. **Parameters of training**: Detailed hyperparameter guide (learning rate $10^{-4}$, weight decay $10^{-4}$, batch size 2–4, prompt types).
+  4. **Parameters of training**: Detailed hyperparameter guide (learning rate $10^{-4}$, weight decay $10^{-4}$, batch size 2–4).
   5. **Live validation**: Tracking both validation loss and mean validation IoU per epoch.
   6. **Inference with fine-tuned checkpoint**: Saving `checkpoint_best.pt` and loading fine-tuned weights into `SAM2Segmentor`.
+
+---
+
+### [Tutorial 03: Training from Paired Directories with Point Prompts](03_train_from_directories.ipynb)
+- **Files**: Notebook ([`03_train_from_directories.ipynb`](03_train_from_directories.ipynb)) and CLI script ([`03_train_from_directories.py`](03_train_from_directories.py))
+- **Key Concepts**:
+  1. **Two Directories Setup**: Passing separate `images_dir` (`.../original/*.fits`) and `masks_dir` (`.../masks/*.fits`).
+  2. **Point Prompts (`prompt_type='point'`)**: Training SAM 2 using foreground clicks instead of bounding boxes.
+  3. **On-the-Fly Object Cropping (`crop_size=512`)**: Extracting $512 \times 512$ patches around sources from full $4088 \times 4088$ exposures in 1ms using memory-mapped I/O.
+  4. **Low-Epoch Verification**: Fast fine-tuning on Apple Silicon MPS with convergence plots and test patch prediction.
 
 ---
 
@@ -48,4 +58,7 @@ python tutorials/01_fits_segment_everything.py
 
 # Run Tutorial 02 (Fine-Tuning on 1 Dataset)
 python tutorials/02_training_sam2_fits.py
+
+# Run Tutorial 03 (Fine-Tuning from Paired Directories with Point Prompts)
+python tutorials/03_train_from_directories.py
 ```
