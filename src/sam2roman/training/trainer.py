@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any, Union, List
+from typing import Optional, Dict, Any, Union, List, Tuple
 
 import numpy as np
 import torch
@@ -41,6 +41,8 @@ class SAM2Trainer:
         Whether to freeze the heavy vision backbone.
     prompt_type : str, default 'point'
         Type of prompt used during training: 'point' or 'box'.
+    use_amp : bool, default True
+        Enable Automatic Mixed Precision (AMP / bfloat16 on NVIDIA A100/H100 GPUs).
     device : str or torch.device, optional
         Target device ('cuda', 'mps', 'cpu').
     """
@@ -53,6 +55,7 @@ class SAM2Trainer:
         weight_decay: float = 1e-4,
         freeze_vision_encoder: bool = True,
         prompt_type: str = "point",
+        use_amp: bool = True,
         device: Optional[Union[str, torch.device]] = None,
     ):
         if model_wrapper is not None:
@@ -65,6 +68,7 @@ class SAM2Trainer:
         self.processor = self.model_wrapper.processor
         self.freeze_vision_encoder = freeze_vision_encoder
         self.prompt_type = prompt_type
+        self.use_amp = use_amp
 
         if self.freeze_vision_encoder:
             self._freeze_encoder()
@@ -96,10 +100,15 @@ class SAM2Trainer:
         )
 
     def train_epoch(self, dataloader: DataLoader) -> float:
-        """Execute one training epoch."""
+        """Execute one training epoch with optional mixed precision (bfloat16 on A100)."""
         self.model.train()
         total_loss = 0.0
         steps = 0
+
+        # Autocast setup: bfloat16 on NVIDIA A100/CUDA, float32 on MPS/CPU
+        device_type = "cuda" if self.device.type == "cuda" else "cpu"
+        use_cuda_amp = self.use_amp and (self.device.type == "cuda")
+        amp_dtype = torch.bfloat16 if (use_cuda_amp and torch.cuda.is_bf16_supported()) else torch.float16
 
         for batch in dataloader:
             images = batch["pil_image"]
@@ -123,18 +132,19 @@ class SAM2Trainer:
                 ).to(self.device)
 
             self.optimizer.zero_grad()
-            outputs = self.model(**proc_inputs)
 
-            pred_logits = outputs.pred_masks[:, 0, 0:1, :, :]
-            if pred_logits.shape[-2:] != target_masks.shape[-2:]:
-                pred_logits = nn.functional.interpolate(
-                    pred_logits,
-                    size=target_masks.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
+            with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_cuda_amp):
+                outputs = self.model(**proc_inputs)
+                pred_logits = outputs.pred_masks[:, 0, 0:1, :, :]
+                if pred_logits.shape[-2:] != target_masks.shape[-2:]:
+                    pred_logits = nn.functional.interpolate(
+                        pred_logits,
+                        size=target_masks.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                loss = self.criterion(pred_logits.float(), target_masks.float())
 
-            loss = self.criterion(pred_logits, target_masks)
             loss.backward()
             self.optimizer.step()
 
@@ -152,6 +162,10 @@ class SAM2Trainer:
         total_loss = 0.0
         total_iou = 0.0
         steps = 0
+
+        device_type = "cuda" if self.device.type == "cuda" else "cpu"
+        use_cuda_amp = self.use_amp and (self.device.type == "cuda")
+        amp_dtype = torch.bfloat16 if (use_cuda_amp and torch.cuda.is_bf16_supported()) else torch.float16
 
         with torch.no_grad():
             for batch in dataloader:
@@ -175,21 +189,21 @@ class SAM2Trainer:
                         return_tensors="pt",
                     ).to(self.device)
 
-                outputs = self.model(**proc_inputs)
-                pred_logits = outputs.pred_masks[:, 0, 0:1, :, :]
+                with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_cuda_amp):
+                    outputs = self.model(**proc_inputs)
+                    pred_logits = outputs.pred_masks[:, 0, 0:1, :, :]
 
-                if pred_logits.shape[-2:] != target_masks.shape[-2:]:
-                    pred_logits = nn.functional.interpolate(
-                        pred_logits,
-                        size=target_masks.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
+                    if pred_logits.shape[-2:] != target_masks.shape[-2:]:
+                        pred_logits = nn.functional.interpolate(
+                            pred_logits,
+                            size=target_masks.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
 
-                loss = self.criterion(pred_logits, target_masks)
+                    loss = self.criterion(pred_logits.float(), target_masks.float())
                 total_loss += loss.item()
 
-                # Calculate IoU metric
                 pred_binary = (pred_logits > 0.0).float()
                 target_binary = (target_masks > 0.0).float()
                 intersection = (pred_binary * target_binary).sum(dim=(-1, -2))
@@ -219,7 +233,7 @@ class SAM2Trainer:
         epochs : int, default 5
             Number of training epochs.
         batch_size : int, default 2
-            Batch size.
+            Batch size. (Can be increased to 16-64 on an NVIDIA A100 GPU).
         val_dataset : AstronomicalDataset, optional
             Optional validation dataset.
         output_dir : str or Path, optional
@@ -273,7 +287,6 @@ class SAM2Trainer:
                 history["val_iou"].append(val_iou)
                 val_str = f" | Val Loss: {val_loss:.4f} | Val IoU: {val_iou:.4f}"
 
-                # Save best checkpoint
                 if output_dir and val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_path = Path(output_dir) / "checkpoint_best.pt"
@@ -282,7 +295,6 @@ class SAM2Trainer:
             if verbose:
                 print(f"Epoch [{epoch:02d}/{epochs:02d}] - Train Loss: {train_loss:.4f}{val_str} ({elapsed:.1f}s)")
 
-            # Save epoch checkpoint
             if output_dir:
                 save_path = Path(output_dir) / f"checkpoint_epoch_{epoch}.pt"
                 self.save_checkpoint(save_path)
