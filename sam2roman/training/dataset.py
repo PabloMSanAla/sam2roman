@@ -46,6 +46,13 @@ class AstronomicalDataset(Dataset):
     samples_per_file : Optional[Union[int, str]], default None
         - None or 'all': Use ALL patches possible (one cutout for every detected object across all files).
         - Integer K (e.g. 10, 20): Extract K cutouts per FITS file per epoch.
+    all_masks_in_crop : bool, default True
+        If True, simultaneously extracts masks and prompts for ALL objects located within the
+        cropped region. If False, trains on only 1 isolated object per crop.
+    max_objects_per_crop : Optional[int], default None
+        Optional cap on maximum number of objects per cropped cutout (e.g. 16 or 32) to bound memory.
+    min_object_pixels : int, default 4
+        Minimum pixel count inside the crop required to include an object (filters tiny edge slivers).
     box_jitter_pct : float, default 0.05
         Fraction of box size to randomly jitter coordinates to build model robustness.
     transform : callable, optional
@@ -60,6 +67,9 @@ class AstronomicalDataset(Dataset):
         prompt_type: str = "point",
         crop_size: Optional[int] = None,
         samples_per_file: Optional[Union[int, str]] = None,
+        all_masks_in_crop: bool = True,
+        max_objects_per_crop: Optional[int] = None,
+        min_object_pixels: int = 4,
         box_jitter_pct: float = 0.05,
         transform: Optional[Any] = None,
     ):
@@ -72,6 +82,9 @@ class AstronomicalDataset(Dataset):
         self.prompt_type = prompt_type
         self.crop_size = crop_size
         self.samples_per_file = samples_per_file
+        self.all_masks_in_crop = all_masks_in_crop
+        self.max_objects_per_crop = max_objects_per_crop
+        self.min_object_pixels = min_object_pixels
         self.box_jitter_pct = box_jitter_pct
         self.transform = transform
 
@@ -117,6 +130,9 @@ class AstronomicalDataset(Dataset):
         pattern: str = "*.fits",
         crop_size: Optional[int] = 512,
         samples_per_file: Optional[Union[int, str]] = None,
+        all_masks_in_crop: bool = True,
+        max_objects_per_crop: Optional[int] = None,
+        min_object_pixels: int = 4,
         prompt_type: str = "point",
         stretch_type: str = "asinh",
         max_samples: Optional[int] = None,
@@ -137,8 +153,14 @@ class AstronomicalDataset(Dataset):
         samples_per_file : Optional[Union[int, str]], default None
             - None or 'all': Use ALL patches possible (one cutout for every detected object).
             - Integer K (e.g. 10, 20): Extract K cutouts per file per epoch.
+        all_masks_in_crop : bool, default True
+            If True, segments all objects located within each cropped region.
+        max_objects_per_crop : Optional[int], default None
+            Optional limit on maximum objects per crop.
+        min_object_pixels : int, default 4
+            Minimum pixels inside crop required to train on an object.
         prompt_type : str, default 'point'
-            Type of prompt to sample: 'point' or 'box'.
+            Type of prompt to sample: 'point', 'box', or 'both'.
         stretch_type : str, default 'asinh'
             Intensity stretch for astronomical conversion.
         max_samples : Optional[int], default None
@@ -183,6 +205,9 @@ class AstronomicalDataset(Dataset):
             prompt_type=prompt_type,
             crop_size=crop_size,
             samples_per_file=samples_per_file,
+            all_masks_in_crop=all_masks_in_crop,
+            max_objects_per_crop=max_objects_per_crop,
+            min_object_pixels=min_object_pixels,
         )
 
     @classmethod
@@ -193,6 +218,9 @@ class AstronomicalDataset(Dataset):
         tile_size: int = 512,
         stride: int = 384,
         min_objects: int = 1,
+        all_masks_in_crop: bool = True,
+        max_objects_per_crop: Optional[int] = None,
+        min_object_pixels: int = 4,
         stretch_type: str = "asinh",
         prompt_type: str = "point",
     ) -> "AstronomicalDataset":
@@ -236,6 +264,9 @@ class AstronomicalDataset(Dataset):
             masks=tiles_mask,
             stretch_type=stretch_type,
             prompt_type=prompt_type,
+            all_masks_in_crop=all_masks_in_crop,
+            max_objects_per_crop=max_objects_per_crop,
+            min_object_pixels=min_object_pixels,
         )
 
     def _load_image_array(self, idx: int) -> np.ndarray:
@@ -299,64 +330,112 @@ class AstronomicalDataset(Dataset):
             y0 = max(0, min(h - cs, cy - cs // 2 + np.random.randint(-15, 16)))
 
             data_patch = raw_data[y0 : y0 + cs, x0 : x0 + cs]
-            mask_patch = (raw_mask[y0 : y0 + cs, x0 : x0 + cs] == target_label).astype(np.float32)
-
-            ys, xs = np.where(mask_patch > 0)
-            if len(xs) > 0:
-                pt_idx = np.random.randint(0, len(xs))
-                point = [float(xs[pt_idx]), float(ys[pt_idx])]
-                label = 1
-                x_min, x_max = float(np.min(xs)), float(np.max(xs))
-                y_min, y_max = float(np.min(ys)), float(np.max(ys))
-            else:
-                point = [float(cs // 2), float(cs // 2)]
-                label = 0
-                x_min, y_min, x_max, y_max = 0.0, 0.0, float(cs), float(cs)
+            crop_raw_mask = raw_mask[y0 : y0 + cs, x0 : x0 + cs]
         else:
             data_patch = raw_data
-            mask_patch = (raw_mask == target_label).astype(np.float32) if target_label > 0 else (raw_mask > 0).astype(np.float32)
+            crop_raw_mask = raw_mask
 
-            ys, xs = np.where(mask_patch > 0)
-            if len(xs) > 0:
+        masks_list = []
+        points_list = []
+        labels_list = []
+        boxes_list = []
+
+        if self.all_masks_in_crop:
+            crop_unique = np.unique(crop_raw_mask)
+            crop_unique = crop_unique[crop_unique > 0]
+
+            # Filter objects with sufficient pixels inside crop
+            valid_labels = [
+                int(lbl)
+                for lbl in crop_unique
+                if np.sum(crop_raw_mask == lbl) >= self.min_object_pixels
+            ]
+            if not valid_labels:
+                if len(crop_unique) > 0:
+                    valid_labels = [int(crop_unique[0])]
+                elif target_label > 0:
+                    valid_labels = [target_label]
+                else:
+                    valid_labels = []
+
+            # Prioritize primary target object first if present
+            if target_label in valid_labels:
+                valid_labels = [target_label] + [lbl for lbl in valid_labels if lbl != target_label]
+
+            # Cap at max_objects_per_crop if configured
+            if self.max_objects_per_crop is not None and len(valid_labels) > self.max_objects_per_crop:
+                primary = valid_labels[0]
+                rest = valid_labels[1:]
+                chosen_rest = list(
+                    np.random.choice(rest, size=self.max_objects_per_crop - 1, replace=False)
+                )
+                valid_labels = [primary] + chosen_rest
+        else:
+            # Single object mode
+            if target_label > 0 and np.sum(crop_raw_mask == target_label) >= self.min_object_pixels:
+                valid_labels = [target_label]
+            elif len(np.unique(crop_raw_mask)[np.unique(crop_raw_mask) > 0]) > 0:
+                first_lbl = int(np.unique(crop_raw_mask)[np.unique(crop_raw_mask) > 0][0])
+                valid_labels = [first_lbl]
+            else:
+                valid_labels = []
+
+        if len(valid_labels) == 0:
+            # Empty / background crop fallback
+            dummy_mask = np.zeros(data_patch.shape, dtype=np.float32)
+            masks_list.append(dummy_mask)
+            points_list.append([float(data_patch.shape[1] // 2), float(data_patch.shape[0] // 2)])
+            labels_list.append(0)
+            boxes_list.append([0.0, 0.0, float(data_patch.shape[1]), float(data_patch.shape[0])])
+        else:
+            for lbl in valid_labels:
+                obj_mask = (crop_raw_mask == lbl).astype(np.float32)
+                ys, xs = np.where(obj_mask > 0)
                 pt_idx = np.random.randint(0, len(xs))
                 point = [float(xs[pt_idx]), float(ys[pt_idx])]
                 label = 1
+
                 x_min, x_max = float(np.min(xs)), float(np.max(xs))
                 y_min, y_max = float(np.min(ys)), float(np.max(ys))
-            else:
-                point = [float(w // 2), float(h // 2)]
-                label = 0
-                x_min, y_min, x_max, y_max = 0.0, 0.0, float(w), float(h)
+
+                bw = max(x_max - x_min, 1.0)
+                bh = max(y_max - y_min, 1.0)
+                if self.box_jitter_pct > 0.0:
+                    jx = (np.random.rand() * 2 - 1) * bw * self.box_jitter_pct
+                    jy = (np.random.rand() * 2 - 1) * bh * self.box_jitter_pct
+                    x_min = max(0.0, x_min + jx)
+                    x_max = min(float(data_patch.shape[1]), x_max + jx)
+                    y_min = max(0.0, y_min + jy)
+                    y_max = min(float(data_patch.shape[0]), y_max + jy)
+
+                masks_list.append(obj_mask)
+                points_list.append(point)
+                labels_list.append(label)
+                boxes_list.append([x_min, y_min, x_max, y_max])
 
         norm = stretch_astro_image(data_patch, stretch_type=self.stretch_type)
         rgb_uint8 = (norm * 255.0).astype(np.uint8)
         rgb_3ch = np.stack([rgb_uint8, rgb_uint8, rgb_uint8], axis=-1)
         pil_image = Image.fromarray(rgb_3ch, mode="RGB")
 
-        bw = max(x_max - x_min, 1.0)
-        bh = max(y_max - y_min, 1.0)
-        if self.box_jitter_pct > 0.0:
-            jx = (np.random.rand() * 2 - 1) * bw * self.box_jitter_pct
-            jy = (np.random.rand() * 2 - 1) * bh * self.box_jitter_pct
-            x_min = max(0.0, x_min + jx)
-            x_max = min(float(data_patch.shape[1]), x_max + jx)
-            y_min = max(0.0, y_min + jy)
-            y_max = min(float(data_patch.shape[0]), y_max + jy)
-
-        box = [x_min, y_min, x_max, y_max]
-
         image_tensor = torch.from_numpy(rgb_3ch).permute(2, 0, 1).float() / 255.0
-        mask_tensor = torch.from_numpy(mask_patch).float().unsqueeze(0)
-        box_tensor = torch.tensor(box, dtype=torch.float32)
-        point_tensor = torch.tensor([point], dtype=torch.float32)
-        label_tensor = torch.tensor([label], dtype=torch.int64)
+        masks_tensor = torch.from_numpy(np.stack(masks_list)[:, None, :, :]).float()  # (M, 1, H, W)
+        boxes_tensor = torch.tensor(boxes_list, dtype=torch.float32)                   # (M, 4)
+        points_tensor = torch.tensor(points_list, dtype=torch.float32).unsqueeze(1)    # (M, 1, 2)
+        labels_tensor = torch.tensor(labels_list, dtype=torch.int64).unsqueeze(1)      # (M, 1)
 
         return {
             "image": image_tensor,
             "pil_image": pil_image,
-            "mask": mask_tensor,
-            "box": box_tensor,
-            "point": point_tensor,
-            "point_label": label_tensor,
+            "masks": masks_tensor,
+            "boxes": boxes_tensor,
+            "points": points_tensor,
+            "point_labels": labels_tensor,
+            "num_objects": len(masks_list),
+            # Single-object backwards-compatible keys:
+            "mask": masks_tensor[0],
+            "box": boxes_tensor[0],
+            "point": points_tensor[0],
+            "point_label": labels_tensor[0],
             "raw_data": data_patch,
         }

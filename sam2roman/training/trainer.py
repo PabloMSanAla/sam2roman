@@ -99,6 +99,66 @@ class SAM2Trainer:
             f"Vision backbone frozen: {frozen_count} tensors frozen, {trainable_count} tensors trainable."
         )
 
+    @staticmethod
+    def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Collate function supporting both multi-mask and single-mask crops with variable object counts."""
+        images = torch.stack([b["image"] for b in batch])
+        pil_images = [b["pil_image"] for b in batch]
+
+        # Multi-object crops with plural 'masks'
+        if "masks" in batch[0]:
+            num_objs = [b["masks"].shape[0] for b in batch]
+            h, w = batch[0]["masks"].shape[-2:]
+            max_m = max(num_objs)
+
+            padded_masks = torch.zeros((len(batch), max_m, 1, h, w), dtype=torch.float32)
+            valid_mask = torch.zeros((len(batch), max_m), dtype=torch.bool)
+            batch_points = []
+            batch_labels = []
+            batch_boxes = []
+
+            for i, b in enumerate(batch):
+                m_i = num_objs[i]
+                padded_masks[i, :m_i] = b["masks"]
+                valid_mask[i, :m_i] = True
+
+                pts = b["points"].tolist()        # list of m_i items, each [[x, y]]
+                lbls = b["point_labels"].tolist() # list of m_i items, each [label]
+
+                # Explicitly pad points to max_m
+                while len(pts) < max_m:
+                    pts.append([[-10.0, -10.0]])
+                    lbls.append([-10])
+
+                box_list = b["boxes"].tolist()     # list of m_i items, each [x1, y1, x2, y2]
+                while len(box_list) < max_m:
+                    box_list.append([0.0, 0.0, 1.0, 1.0])
+
+                batch_points.append(pts)
+                batch_labels.append(lbls)
+                batch_boxes.append(box_list)
+
+            return {
+                "image": images,
+                "pil_image": pil_images,
+                "masks": padded_masks,
+                "valid_mask": valid_mask,
+                "points": batch_points,
+                "point_labels": batch_labels,
+                "boxes": batch_boxes,
+            }
+        else:
+            # Fallback for single-object legacy samples
+            return {
+                "image": images,
+                "pil_image": pil_images,
+                "masks": torch.stack([b["mask"] for b in batch]).unsqueeze(1),
+                "valid_mask": torch.ones((len(batch), 1), dtype=torch.bool),
+                "boxes": [[b["box"].tolist()] for b in batch],
+                "points": [[[b["point"].squeeze(0).tolist()]] for b in batch],
+                "point_labels": [[[int(b["point_label"].item())]] for b in batch],
+            }
+
     def train_epoch(self, dataloader: DataLoader) -> float:
         """Execute one training epoch with optional mixed precision (bfloat16 on A100)."""
         self.model.train()
@@ -112,22 +172,28 @@ class SAM2Trainer:
 
         for batch in dataloader:
             images = batch["pil_image"]
-            target_masks = batch["mask"].to(self.device)  # (B, 1, H, W)
+            target_masks = batch["masks"].to(self.device)  # (B, M_max, 1, H, W)
+            valid_mask = batch["valid_mask"].to(self.device) # (B, M_max)
 
             if self.prompt_type == "box":
-                boxes = batch["box"].unsqueeze(1).tolist()  # (B, 1, 4)
                 proc_inputs = self.processor(
                     images=images,
-                    input_boxes=boxes,
+                    input_boxes=batch["boxes"],
+                    return_tensors="pt",
+                ).to(self.device)
+            elif self.prompt_type == "both":
+                proc_inputs = self.processor(
+                    images=images,
+                    input_boxes=batch["boxes"],
+                    input_points=batch["points"],
+                    input_labels=batch["point_labels"],
                     return_tensors="pt",
                 ).to(self.device)
             else:
-                points = batch["point"].unsqueeze(1).tolist()  # (B, 1, 1, 2)
-                labels = batch["point_label"].unsqueeze(1).tolist()
                 proc_inputs = self.processor(
                     images=images,
-                    input_points=points,
-                    input_labels=labels,
+                    input_points=batch["points"],
+                    input_labels=batch["point_labels"],
                     return_tensors="pt",
                 ).to(self.device)
 
@@ -135,15 +201,20 @@ class SAM2Trainer:
 
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_cuda_amp):
                 outputs = self.model(**proc_inputs)
-                pred_logits = outputs.pred_masks[:, 0, 0:1, :, :]
-                if pred_logits.shape[-2:] != target_masks.shape[-2:]:
-                    pred_logits = nn.functional.interpolate(
-                        pred_logits,
-                        size=target_masks.shape[-2:],
+                pred_logits = outputs.pred_masks[:, :, 0:1, :, :]  # (B, M_max, 1, 256, 256)
+
+                # Filter valid objects across the batch
+                valid_preds = pred_logits[valid_mask]      # (Total_Valid_M, 1, 256, 256)
+                valid_targets = target_masks[valid_mask]  # (Total_Valid_M, 1, H, W)
+
+                if valid_preds.shape[-2:] != valid_targets.shape[-2:]:
+                    valid_preds = nn.functional.interpolate(
+                        valid_preds,
+                        size=valid_targets.shape[-2:],
                         mode="bilinear",
                         align_corners=False,
                     )
-                loss = self.criterion(pred_logits.float(), target_masks.float())
+                loss = self.criterion(valid_preds.float(), valid_targets.float())
 
             loss.backward()
             self.optimizer.step()
@@ -170,42 +241,51 @@ class SAM2Trainer:
         with torch.no_grad():
             for batch in dataloader:
                 images = batch["pil_image"]
-                target_masks = batch["mask"].to(self.device)
+                target_masks = batch["masks"].to(self.device)
+                valid_mask = batch["valid_mask"].to(self.device)
 
                 if self.prompt_type == "box":
-                    boxes = batch["box"].unsqueeze(1).tolist()
                     proc_inputs = self.processor(
                         images=images,
-                        input_boxes=boxes,
+                        input_boxes=batch["boxes"],
+                        return_tensors="pt",
+                    ).to(self.device)
+                elif self.prompt_type == "both":
+                    proc_inputs = self.processor(
+                        images=images,
+                        input_boxes=batch["boxes"],
+                        input_points=batch["points"],
+                        input_labels=batch["point_labels"],
                         return_tensors="pt",
                     ).to(self.device)
                 else:
-                    points = batch["point"].unsqueeze(1).tolist()
-                    labels = batch["point_label"].unsqueeze(1).tolist()
                     proc_inputs = self.processor(
                         images=images,
-                        input_points=points,
-                        input_labels=labels,
+                        input_points=batch["points"],
+                        input_labels=batch["point_labels"],
                         return_tensors="pt",
                     ).to(self.device)
 
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_cuda_amp):
                     outputs = self.model(**proc_inputs)
-                    pred_logits = outputs.pred_masks[:, 0, 0:1, :, :]
+                    pred_logits = outputs.pred_masks[:, :, 0:1, :, :]
 
-                    if pred_logits.shape[-2:] != target_masks.shape[-2:]:
-                        pred_logits = nn.functional.interpolate(
-                            pred_logits,
-                            size=target_masks.shape[-2:],
+                    valid_preds = pred_logits[valid_mask]
+                    valid_targets = target_masks[valid_mask]
+
+                    if valid_preds.shape[-2:] != valid_targets.shape[-2:]:
+                        valid_preds = nn.functional.interpolate(
+                            valid_preds,
+                            size=valid_targets.shape[-2:],
                             mode="bilinear",
                             align_corners=False,
                         )
 
-                    loss = self.criterion(pred_logits.float(), target_masks.float())
+                    loss = self.criterion(valid_preds.float(), valid_targets.float())
                 total_loss += loss.item()
 
-                pred_binary = (pred_logits > 0.0).float()
-                target_binary = (target_masks > 0.0).float()
+                pred_binary = (valid_preds > 0.0).float()
+                target_binary = (valid_targets > 0.0).float()
                 intersection = (pred_binary * target_binary).sum(dim=(-1, -2))
                 union = pred_binary.sum(dim=(-1, -2)) + target_binary.sum(dim=(-1, -2)) - intersection
                 iou = (intersection + 1e-6) / (union + 1e-6)
@@ -233,7 +313,7 @@ class SAM2Trainer:
         epochs : int, default 5
             Number of training epochs.
         batch_size : int, default 2
-            Batch size. (Can be increased to 16-64 on an NVIDIA A100 GPU).
+            Batch size of cropped images.
         val_dataset : AstronomicalDataset, optional
             Optional validation dataset.
         output_dir : str or Path, optional
@@ -241,19 +321,9 @@ class SAM2Trainer:
         verbose : bool, default True
             Print progress and metrics per epoch.
         """
-        def collate_fn(batch):
-            return {
-                "image": torch.stack([b["image"] for b in batch]),
-                "pil_image": [b["pil_image"] for b in batch],
-                "mask": torch.stack([b["mask"] for b in batch]),
-                "box": torch.stack([b["box"] for b in batch]),
-                "point": torch.stack([b["point"] for b in batch]),
-                "point_label": torch.stack([b["point_label"] for b in batch]),
-            }
-
-        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=self.collate_fn)
         val_loader = (
-            DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+            DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=self.collate_fn)
             if val_dataset is not None
             else None
         )
@@ -269,9 +339,14 @@ class SAM2Trainer:
         if verbose:
             print(f"[sam2roman] Starting fine-tuning for {epochs} epochs on {self.device}...")
             print(f"  -> Trainable parameters: {sum(p.numel() for p in self.trainable_params):,}")
-            print(f"  -> Training samples:     {len(dataset)}")
+            is_multi = getattr(dataset, "all_masks_in_crop", getattr(getattr(dataset, "dataset", None), "all_masks_in_crop", False))
+            multi_str = " (all masks in crop)" if is_multi else " (1 mask per crop)"
+            print(f"  -> Training crops:       {len(dataset)}{multi_str}")
             if val_dataset:
-                print(f"  -> Validation samples:   {len(val_dataset)}")
+                is_val_multi = getattr(val_dataset, "all_masks_in_crop", getattr(getattr(val_dataset, "dataset", None), "all_masks_in_crop", False))
+                val_multi_str = " (all masks in crop)" if is_val_multi else " (1 mask per crop)"
+                print(f"  -> Validation crops:     {len(val_dataset)}{val_multi_str}")
+            print(f"  -> Prompt mode:          {self.prompt_type}")
             print("-" * 65)
 
         for epoch in range(1, epochs + 1):
