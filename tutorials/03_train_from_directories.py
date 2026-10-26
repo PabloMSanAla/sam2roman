@@ -46,18 +46,20 @@ def main():
     print(f"  -> Masks:  {masks_dir}")
 
     # 2. Build Dataset from Directories with Point Prompts
-    # crop_size=512 extracts 512x512 cutouts around target objects from the 4088x4088 fields
-    max_samples = 16  # Set to None to use all 108 detector exposures
+    # - samples_per_file=None: extracts ALL patches possible (one cutout for every detected object)
+    # - samples_per_file=10:   extracts 10 random object cutouts per FITS file
+    max_samples = 4  # Number of FITS files to match (or None for all 108 files)
     dataset = AstronomicalDataset.from_directories(
         images_dir=images_dir,
         masks_dir=masks_dir,
         pattern="*.fits",
         crop_size=512,
-        prompt_type="point",  # POINT PROMPTS as requested
+        prompt_type="point",       # POINT PROMPTS as requested
+        samples_per_file=None,     # None = ALL patches possible across all objects!
         stretch_type="asinh",
         max_samples=max_samples,
     )
-    print(f"  -> Matched {len(dataset)} paired exposures!")
+    print(f"  -> Extracted ALL {len(dataset)} possible object-centered patches from {max_samples} exposures!")
 
     # 3. Train / Validation Split (80% / 20%)
     n_train = max(1, int(0.8 * len(dataset)))

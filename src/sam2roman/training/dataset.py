@@ -4,6 +4,7 @@ PyTorch Dataset for astronomical images and segmentation targets.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import List, Optional, Tuple, Union, Dict, Any
 
@@ -12,8 +13,11 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 from astropy.io import fits
+from scipy.ndimage import center_of_mass
 
 from sam2roman.io.fits import FITSImage, stretch_astro_image
+
+logger = logging.getLogger(__name__)
 
 
 class AstronomicalDataset(Dataset):
@@ -23,8 +27,9 @@ class AstronomicalDataset(Dataset):
     Supports:
     1. Paired directories of FITS images and masks (`from_directories`).
     2. Master FITS tiled slicing (`from_single_fits_tiled`).
-    3. On-the-fly random object cropping for large detector images (e.g. 4088x4088).
-    4. Point prompts and bounding box prompts with coordinate translation.
+    3. `samples_per_file=None`: Uses ALL patches possible (one cutout for every detected object).
+    4. `samples_per_file=K`: Extracts K random object cutouts per file per epoch.
+    5. Point prompts and bounding box prompts with coordinate translation.
 
     Parameters
     ----------
@@ -37,7 +42,10 @@ class AstronomicalDataset(Dataset):
     prompt_type : str, default 'point'
         Type of training prompt: 'point', 'box', or 'both'.
     crop_size : Optional[int], default None
-        If specified (e.g. 512), crops a window around a randomly sampled object on-the-fly.
+        If specified (e.g. 512), crops a window around a target object.
+    samples_per_file : Optional[Union[int, str]], default None
+        - None or 'all': Use ALL patches possible (one cutout for every detected object across all files).
+        - Integer K (e.g. 10, 20): Extract K cutouts per FITS file per epoch.
     box_jitter_pct : float, default 0.05
         Fraction of box size to randomly jitter coordinates to build model robustness.
     transform : callable, optional
@@ -51,6 +59,7 @@ class AstronomicalDataset(Dataset):
         stretch_type: str = "asinh",
         prompt_type: str = "point",
         crop_size: Optional[int] = None,
+        samples_per_file: Optional[Union[int, str]] = None,
         box_jitter_pct: float = 0.05,
         transform: Optional[Any] = None,
     ):
@@ -62,11 +71,43 @@ class AstronomicalDataset(Dataset):
         self.stretch_type = stretch_type
         self.prompt_type = prompt_type
         self.crop_size = crop_size
+        self.samples_per_file = samples_per_file
         self.box_jitter_pct = box_jitter_pct
         self.transform = transform
 
+        self.indexed_objects: Optional[List[Dict[str, Any]]] = None
+
+        # If samples_per_file is None or 'all', index every object across all files
+        if (self.samples_per_file is None or self.samples_per_file == "all") and self.crop_size is not None:
+            self._build_all_objects_index()
+
+    def _build_all_objects_index(self) -> None:
+        """Scan masks to index every discrete object (centroid and label) for all patches possible."""
+        self.indexed_objects = []
+        for file_idx, mask_item in enumerate(self.masks):
+            raw_mask = self._load_mask_array(file_idx)
+            unique_labels = np.unique(raw_mask)
+            unique_labels = unique_labels[unique_labels > 0]
+
+            if len(unique_labels) == 0:
+                continue
+
+            centroids = center_of_mass(raw_mask > 0, labels=raw_mask, index=unique_labels)
+            for lbl, (cy, cx) in zip(unique_labels, centroids):
+                self.indexed_objects.append({
+                    "file_idx": file_idx,
+                    "target_label": int(lbl),
+                    "cx": int(cx),
+                    "cy": int(cy),
+                })
+
     def __len__(self) -> int:
-        return len(self.images)
+        if self.indexed_objects is not None:
+            return len(self.indexed_objects)
+        elif isinstance(self.samples_per_file, int):
+            return len(self.images) * self.samples_per_file
+        else:
+            return len(self.images)
 
     @classmethod
     def from_directories(
@@ -75,6 +116,7 @@ class AstronomicalDataset(Dataset):
         masks_dir: Union[str, Path],
         pattern: str = "*.fits",
         crop_size: Optional[int] = 512,
+        samples_per_file: Optional[Union[int, str]] = None,
         prompt_type: str = "point",
         stretch_type: str = "asinh",
         max_samples: Optional[int] = None,
@@ -92,12 +134,15 @@ class AstronomicalDataset(Dataset):
             File matching pattern (e.g., '*.fits', '*.fits.gz').
         crop_size : Optional[int], default 512
             Crop window size around target objects (recommended for large 4088x4088 images).
+        samples_per_file : Optional[Union[int, str]], default None
+            - None or 'all': Use ALL patches possible (one cutout for every detected object).
+            - Integer K (e.g. 10, 20): Extract K cutouts per file per epoch.
         prompt_type : str, default 'point'
             Type of prompt to sample: 'point' or 'box'.
         stretch_type : str, default 'asinh'
             Intensity stretch for astronomical conversion.
         max_samples : Optional[int], default None
-            Maximum number of image-mask pairs to load.
+            Maximum number of FITS files to match.
         """
         images_path = Path(images_dir)
         masks_path = Path(masks_dir)
@@ -114,7 +159,6 @@ class AstronomicalDataset(Dataset):
         for img_p in img_files:
             mask_p = masks_path / img_p.name
             if not mask_p.exists():
-                # Try alternate extensions or case
                 candidates = list(masks_path.glob(f"{img_p.stem}.*"))
                 if candidates:
                     mask_p = candidates[0]
@@ -138,6 +182,7 @@ class AstronomicalDataset(Dataset):
             stretch_type=stretch_type,
             prompt_type=prompt_type,
             crop_size=crop_size,
+            samples_per_file=samples_per_file,
         )
 
     @classmethod
@@ -151,10 +196,7 @@ class AstronomicalDataset(Dataset):
         stretch_type: str = "asinh",
         prompt_type: str = "point",
     ) -> "AstronomicalDataset":
-        """
-        Create a multi-sample dataset from ONE single large astronomical FITS image and segmap
-        by slicing it into overlapping tiles/cutouts (e.g. 512x512).
-        """
+        """Create a multi-sample dataset from ONE single large FITS image and segmap by slicing into tiles."""
         if isinstance(fits_image, (str, Path)):
             raw_data = FITSImage.from_file(fits_image).data
         elif isinstance(fits_image, FITSImage):
@@ -218,34 +260,47 @@ class AstronomicalDataset(Dataset):
         return np.asarray(item, dtype=np.int32)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        raw_data = self._load_image_array(idx)
-        raw_mask = self._load_mask_array(idx)
+        if self.indexed_objects is not None:
+            # Mode: ALL patches possible (exact object index)
+            obj_meta = self.indexed_objects[idx]
+            file_idx = obj_meta["file_idx"]
+            target_label = obj_meta["target_label"]
+            cx, cy = obj_meta["cx"], obj_meta["cy"]
+        elif isinstance(self.samples_per_file, int):
+            # Mode: K samples per file
+            file_idx = idx // self.samples_per_file
+            target_label = None
+            cx, cy = None, None
+        else:
+            file_idx = idx
+            target_label = None
+            cx, cy = None, None
 
+        raw_data = self._load_image_array(file_idx)
+        raw_mask = self._load_mask_array(file_idx)
         h, w = raw_data.shape
 
-        # Select target object
-        unique_labels = np.unique(raw_mask)
-        unique_labels = unique_labels[unique_labels > 0]
+        # Select target object if not pre-indexed
+        if target_label is None:
+            unique_labels = np.unique(raw_mask)
+            unique_labels = unique_labels[unique_labels > 0]
+            if len(unique_labels) > 0:
+                target_label = int(np.random.choice(unique_labels))
+                ys_all, xs_all = np.where(raw_mask == target_label)
+                cx, cy = int(np.mean(xs_all)), int(np.mean(ys_all))
+            else:
+                target_label = 0
+                cx, cy = w // 2, h // 2
 
-        if len(unique_labels) > 0:
-            target_label = np.random.choice(unique_labels)
-            target_mask_full = (raw_mask == target_label)
-            ys_all, xs_all = np.where(target_mask_full)
-            cx, cy = int(np.mean(xs_all)), int(np.mean(ys_all))
-        else:
-            target_label = 0
-            cx, cy = w // 2, h // 2
-
-        # Optional on-the-fly cropping around the target object
+        # Cutout extraction around target object
         if self.crop_size is not None and (h > self.crop_size or w > self.crop_size):
             cs = self.crop_size
-            x0 = max(0, min(w - cs, cx - cs // 2 + np.random.randint(-20, 20)))
-            y0 = max(0, min(h - cs, cy - cs // 2 + np.random.randint(-20, 20)))
+            x0 = max(0, min(w - cs, cx - cs // 2 + np.random.randint(-15, 16)))
+            y0 = max(0, min(h - cs, cy - cs // 2 + np.random.randint(-15, 16)))
 
             data_patch = raw_data[y0 : y0 + cs, x0 : x0 + cs]
             mask_patch = (raw_mask[y0 : y0 + cs, x0 : x0 + cs] == target_label).astype(np.float32)
 
-            # Local coordinates
             ys, xs = np.where(mask_patch > 0)
             if len(xs) > 0:
                 pt_idx = np.random.randint(0, len(xs))
@@ -273,13 +328,11 @@ class AstronomicalDataset(Dataset):
                 label = 0
                 x_min, y_min, x_max, y_max = 0.0, 0.0, float(w), float(h)
 
-        # Stretch patch to RGB uint8
         norm = stretch_astro_image(data_patch, stretch_type=self.stretch_type)
         rgb_uint8 = (norm * 255.0).astype(np.uint8)
         rgb_3ch = np.stack([rgb_uint8, rgb_uint8, rgb_uint8], axis=-1)
         pil_image = Image.fromarray(rgb_3ch, mode="RGB")
 
-        # Bounding box with optional jitter
         bw = max(x_max - x_min, 1.0)
         bh = max(y_max - y_min, 1.0)
         if self.box_jitter_pct > 0.0:
@@ -292,9 +345,8 @@ class AstronomicalDataset(Dataset):
 
         box = [x_min, y_min, x_max, y_max]
 
-        # Convert to PyTorch tensors
         image_tensor = torch.from_numpy(rgb_3ch).permute(2, 0, 1).float() / 255.0
-        mask_tensor = torch.from_numpy(mask_patch).float().unsqueeze(0)  # (1, H, W)
+        mask_tensor = torch.from_numpy(mask_patch).float().unsqueeze(0)
         box_tensor = torch.tensor(box, dtype=torch.float32)
         point_tensor = torch.tensor([point], dtype=torch.float32)
         label_tensor = torch.tensor([label], dtype=torch.int64)
