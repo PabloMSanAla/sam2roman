@@ -58,7 +58,8 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["sam2roman*"]
 
 [tool.ruff]
 line-length = 100
