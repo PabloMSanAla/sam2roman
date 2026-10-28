@@ -13,14 +13,20 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from PIL import Image
 
+from sam2roman.visualization.stretch import leakySB
+
 
 def stretch_astro_image(
     data: np.ndarray,
-    stretch_type: str = "asinh",
+    stretch_type: str = "leakysb",
     lower_percentile: float = 1.0,
     upper_percentile: float = 99.5,
     asinh_a: float = 0.05,
     log_a: float = 1000.0,
+    zero_points: float = 31.4,
+    pixel_scale: float = 0.11,
+    mmin: float = 13.0,
+    mmax: float = 32.0,
 ) -> np.ndarray:
     """
     Stretch a 2D astronomical array into normalized [0.0, 1.0] float32 values.
@@ -29,16 +35,26 @@ def stretch_astro_image(
     ----------
     data : np.ndarray
         2D astronomical data array.
-    stretch_type : str, default 'asinh'
-        Type of stretch: 'asinh', 'zscale', 'percentile', 'linear', 'log', or 'sqrt'.
+    stretch_type : str, default 'leakysb'
+        Type of stretch: 'leakysb', 'asinh', 'zscale', 'percentile', 'linear', 'log', or 'sqrt'.
+        'leakysb' converts physical fluxes into normalized surface brightness (mag/arcsec^2)
+        preserving high dynamic ranges without clipping.
     lower_percentile : float, default 1.0
-        Lower percentile for background clipping.
+        Lower percentile for background clipping (used by empirical percentile stretches).
     upper_percentile : float, default 99.5
-        Upper percentile for peak clipping.
+        Upper percentile for peak clipping (used by empirical percentile stretches).
     asinh_a : float, default 0.05
         Softening parameter for asinh stretch (lower values show fainter structures).
     log_a : float, default 1000.0
         Scale factor for log stretch.
+    zero_points : float, default 31.4
+        Photometric zero point for leakySB.
+    pixel_scale : float, default 0.11
+        Plate scale in arcseconds/pixel (Roman WFI is 0.11 "/px).
+    mmin : float, default 13.0
+        Bright-end magnitude limit for leakySB.
+    mmax : float, default 32.0
+        Faint-end magnitude limit for leakySB.
 
     Returns
     -------
@@ -54,7 +70,23 @@ def stretch_astro_image(
     bg_val = float(np.nanmedian(img))
     img[~valid_mask] = bg_val
 
-    # Percentile clipping
+    stretch_type = stretch_type.lower()
+
+    if stretch_type in ("leakysb", "leaky_sb"):
+        # leakySB maps physical astronomical fluxes into (0.0, 1.0)
+        rgb = leakySB(
+            img,
+            img,
+            img,
+            zero_points=zero_points,
+            pixel_scale=pixel_scale,
+            mmin=mmin,
+            mmax=mmax,
+            channels_last=True,
+        )
+        return np.clip(rgb[..., 0], 0.0, 1.0).astype(np.float32)
+
+    # Percentile clipping for empirical stretches
     vmin = float(np.nanpercentile(img, lower_percentile))
     vmax = float(np.nanpercentile(img, upper_percentile))
 
@@ -67,7 +99,6 @@ def stretch_astro_image(
     # Normalize to [0, 1] before non-linear stretch
     norm = (clipped - vmin) / (vmax - vmin)
 
-    stretch_type = stretch_type.lower()
     if stretch_type == "linear":
         stretched = norm
     elif stretch_type == "asinh":
@@ -81,7 +112,7 @@ def stretch_astro_image(
         stretched = norm
     else:
         raise ValueError(
-            f"Unsupported stretch_type: {stretch_type}. Choose 'asinh', 'linear', 'log', 'sqrt', or 'zscale'."
+            f"Unsupported stretch_type: {stretch_type}. Choose 'leakysb', 'asinh', 'linear', 'log', 'sqrt', or 'zscale'."
         )
 
     return np.clip(stretched, 0.0, 1.0).astype(np.float32)
@@ -156,14 +187,19 @@ class FITSImage:
 
     def to_rgb(
         self,
-        stretch_type: str = "asinh",
+        stretch_type: str = "leakysb",
         lower_percentile: float = 1.0,
         upper_percentile: float = 99.5,
         asinh_a: float = 0.05,
+        zero_points: float = 31.4,
+        pixel_scale: float = 0.11,
+        mmin: float = 13.0,
+        mmax: float = 32.0,
     ) -> np.ndarray:
         """
         Convert 2D astronomical image data to a 3-channel (H, W, 3) uint8 RGB array.
-        SAM 2 expects 3-channel RGB image format.
+        SAM 2 expects 3-channel RGB image format. For single-band astronomical FITS
+        images, the same channel is repeated across R, G, and B.
 
         Returns
         -------
@@ -176,6 +212,10 @@ class FITSImage:
             lower_percentile=lower_percentile,
             upper_percentile=upper_percentile,
             asinh_a=asinh_a,
+            zero_points=zero_points,
+            pixel_scale=pixel_scale,
+            mmin=mmin,
+            mmax=mmax,
         )
         uint8_data = (norm * 255.0).astype(np.uint8)
         # Duplicate single-band channel across 3 RGB channels
@@ -184,19 +224,28 @@ class FITSImage:
 
     def to_pil(
         self,
-        stretch_type: str = "asinh",
+        stretch_type: str = "leakysb",
         lower_percentile: float = 1.0,
         upper_percentile: float = 99.5,
         asinh_a: float = 0.05,
+        zero_points: float = 31.4,
+        pixel_scale: float = 0.11,
+        mmin: float = 13.0,
+        mmax: float = 32.0,
     ) -> Image.Image:
         """
         Convert astronomical data to a PIL RGB Image ready for Hugging Face SAM 2 Processor.
+        Uses the same channel repeated across R, G, and B.
         """
         rgb_arr = self.to_rgb(
             stretch_type=stretch_type,
             lower_percentile=lower_percentile,
             upper_percentile=upper_percentile,
             asinh_a=asinh_a,
+            zero_points=zero_points,
+            pixel_scale=pixel_scale,
+            mmin=mmin,
+            mmax=mmax,
         )
         return Image.fromarray(rgb_arr, mode="RGB")
 

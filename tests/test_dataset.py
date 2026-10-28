@@ -100,3 +100,27 @@ def test_max_objects_cap():
     sample = ds[0]
     assert sample["num_objects"] == 3
     assert sample["masks"].shape == (3, 1, 256, 256)
+
+
+def test_leakysb_default_and_rgb_identical_channels():
+    img = np.random.normal(15.0, 2.0, (128, 128)).astype(np.float32)
+    mask = np.zeros((128, 128), dtype=np.int32)
+    mask[30:50, 30:50] = 1
+
+    ds = AstronomicalDataset(images=[img], masks=[mask])
+    assert ds.stretch_type == "leakysb"
+
+    sample = ds[0]
+    # Check shape: 3 channels
+    image_tensor = sample["image"]
+    assert image_tensor.shape == (3, 128, 128)
+
+    # Check identical channels for R, G, B
+    np.testing.assert_allclose(image_tensor[0].numpy(), image_tensor[1].numpy(), atol=1e-6)
+    np.testing.assert_allclose(image_tensor[1].numpy(), image_tensor[2].numpy(), atol=1e-6)
+
+    # Check PIL image has 3 identical channels
+    pil_arr = np.array(sample["pil_image"])
+    assert pil_arr.shape == (128, 128, 3)
+    np.testing.assert_array_equal(pil_arr[..., 0], pil_arr[..., 1])
+    np.testing.assert_array_equal(pil_arr[..., 1], pil_arr[..., 2])

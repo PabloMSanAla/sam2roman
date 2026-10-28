@@ -37,8 +37,8 @@ class AstronomicalDataset(Dataset):
         List of astronomical FITS file paths, FITSImage objects, or 2D numpy arrays.
     masks : List[Union[str, Path, np.ndarray]]
         List of 2D binary masks, multi-object segmentation maps, or FITS mask filepaths.
-    stretch_type : str, default 'asinh'
-        Astronomical stretch for FITS conversion.
+    stretch_type : str, default 'leakysb'
+        Astronomical stretch for FITS conversion ('leakysb', 'asinh', 'zscale', 'linear', 'log', 'sqrt').
     prompt_type : str, default 'point'
         Type of training prompt: 'point', 'box', or 'both'.
     crop_size : Optional[int], default None
@@ -55,6 +55,14 @@ class AstronomicalDataset(Dataset):
         Minimum pixel count inside the crop required to include an object (filters tiny edge slivers).
     box_jitter_pct : float, default 0.05
         Fraction of box size to randomly jitter coordinates to build model robustness.
+    zero_points : float, default 31.4
+        Photometric zero point for leakySB stretch.
+    pixel_scale : float, default 0.11
+        Plate scale in arcseconds per pixel (Roman WFI is 0.11 "/px).
+    mmin : float, default 13.0
+        Bright-end magnitude limit for leakySB.
+    mmax : float, default 32.0
+        Faint-end magnitude limit for leakySB.
     transform : callable, optional
         Optional augmentations.
     """
@@ -63,7 +71,7 @@ class AstronomicalDataset(Dataset):
         self,
         images: List[Union[str, Path, np.ndarray, FITSImage]],
         masks: List[Union[str, Path, np.ndarray]],
-        stretch_type: str = "asinh",
+        stretch_type: str = "leakysb",
         prompt_type: str = "point",
         crop_size: Optional[int] = None,
         samples_per_file: Optional[Union[int, str]] = None,
@@ -71,6 +79,10 @@ class AstronomicalDataset(Dataset):
         max_objects_per_crop: Optional[int] = None,
         min_object_pixels: int = 4,
         box_jitter_pct: float = 0.05,
+        zero_points: float = 31.4,
+        pixel_scale: float = 0.11,
+        mmin: float = 13.0,
+        mmax: float = 32.0,
         transform: Optional[Any] = None,
     ):
         if len(images) != len(masks):
@@ -86,6 +98,10 @@ class AstronomicalDataset(Dataset):
         self.max_objects_per_crop = max_objects_per_crop
         self.min_object_pixels = min_object_pixels
         self.box_jitter_pct = box_jitter_pct
+        self.zero_points = zero_points
+        self.pixel_scale = pixel_scale
+        self.mmin = mmin
+        self.mmax = mmax
         self.transform = transform
 
         self.indexed_objects: Optional[List[Dict[str, Any]]] = None
@@ -134,7 +150,11 @@ class AstronomicalDataset(Dataset):
         max_objects_per_crop: Optional[int] = None,
         min_object_pixels: int = 4,
         prompt_type: str = "point",
-        stretch_type: str = "asinh",
+        stretch_type: str = "leakysb",
+        zero_points: float = 31.4,
+        pixel_scale: float = 0.11,
+        mmin: float = 13.0,
+        mmax: float = 32.0,
         max_samples: Optional[int] = None,
     ) -> "AstronomicalDataset":
         """
@@ -161,8 +181,16 @@ class AstronomicalDataset(Dataset):
             Minimum pixels inside crop required to train on an object.
         prompt_type : str, default 'point'
             Type of prompt to sample: 'point', 'box', or 'both'.
-        stretch_type : str, default 'asinh'
-            Intensity stretch for astronomical conversion.
+        stretch_type : str, default 'leakysb'
+            Intensity stretch for astronomical conversion ('leakysb', 'asinh', etc.).
+        zero_points : float, default 31.4
+            Photometric zero point for leakySB.
+        pixel_scale : float, default 0.11
+            Plate scale in arcseconds per pixel (Roman WFI is 0.11 "/px).
+        mmin : float, default 13.0
+            Bright-end magnitude limit for leakySB.
+        mmax : float, default 32.0
+            Faint-end magnitude limit for leakySB.
         max_samples : Optional[int], default None
             Maximum number of FITS files to match.
         """
@@ -208,6 +236,10 @@ class AstronomicalDataset(Dataset):
             all_masks_in_crop=all_masks_in_crop,
             max_objects_per_crop=max_objects_per_crop,
             min_object_pixels=min_object_pixels,
+            zero_points=zero_points,
+            pixel_scale=pixel_scale,
+            mmin=mmin,
+            mmax=mmax,
         )
 
     @classmethod
@@ -221,8 +253,12 @@ class AstronomicalDataset(Dataset):
         all_masks_in_crop: bool = True,
         max_objects_per_crop: Optional[int] = None,
         min_object_pixels: int = 4,
-        stretch_type: str = "asinh",
+        stretch_type: str = "leakysb",
         prompt_type: str = "point",
+        zero_points: float = 31.4,
+        pixel_scale: float = 0.11,
+        mmin: float = 13.0,
+        mmax: float = 32.0,
     ) -> "AstronomicalDataset":
         """Create a multi-sample dataset from ONE single large FITS image and segmap by slicing into tiles."""
         if isinstance(fits_image, (str, Path)):
@@ -267,6 +303,10 @@ class AstronomicalDataset(Dataset):
             all_masks_in_crop=all_masks_in_crop,
             max_objects_per_crop=max_objects_per_crop,
             min_object_pixels=min_object_pixels,
+            zero_points=zero_points,
+            pixel_scale=pixel_scale,
+            mmin=mmin,
+            mmax=mmax,
         )
 
     def _load_image_array(self, idx: int) -> np.ndarray:
@@ -413,8 +453,16 @@ class AstronomicalDataset(Dataset):
                 labels_list.append(label)
                 boxes_list.append([x_min, y_min, x_max, y_max])
 
-        norm = stretch_astro_image(data_patch, stretch_type=self.stretch_type)
+        norm = stretch_astro_image(
+            data_patch,
+            stretch_type=self.stretch_type,
+            zero_points=self.zero_points,
+            pixel_scale=self.pixel_scale,
+            mmin=self.mmin,
+            mmax=self.mmax,
+        )
         rgb_uint8 = (norm * 255.0).astype(np.uint8)
+        # Use identical single-band channel for R, G, and B
         rgb_3ch = np.stack([rgb_uint8, rgb_uint8, rgb_uint8], axis=-1)
         pil_image = Image.fromarray(rgb_3ch, mode="RGB")
 

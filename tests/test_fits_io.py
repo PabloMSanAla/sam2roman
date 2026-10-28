@@ -11,7 +11,7 @@ def test_stretch_astro_image_shapes_and_bounds():
     # Add a bright star
     data[30:35, 30:35] += 500.0
 
-    for s_type in ["asinh", "linear", "log", "sqrt", "zscale"]:
+    for s_type in ["leakysb", "asinh", "linear", "log", "sqrt", "zscale"]:
         stretched = stretch_astro_image(data, stretch_type=s_type)
         assert stretched.shape == (64, 64)
         assert stretched.min() >= 0.0
@@ -23,9 +23,13 @@ def test_fits_image_loading_and_rgb(sample_fits_path):
     assert fits_img.shape == (128, 128)
     assert fits_img.data.dtype == np.float32
 
-    rgb = fits_img.to_rgb(stretch_type="asinh")
+    # Default stretch should now be leakysb
+    rgb = fits_img.to_rgb()
     assert rgb.shape == (128, 128, 3)
     assert rgb.dtype == np.uint8
+    # Verify same channel across R, G, and B
+    np.testing.assert_array_equal(rgb[..., 0], rgb[..., 1])
+    np.testing.assert_array_equal(rgb[..., 1], rgb[..., 2])
 
     pil_img = fits_img.to_pil()
     assert pil_img.size == (128, 128)

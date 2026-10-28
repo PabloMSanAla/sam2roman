@@ -48,7 +48,7 @@ def main():
     # 2. Build Dataset from Directories with Point Prompts
     # - all_masks_in_crop=True: segments ALL objects inside each 512x512 crop simultaneously!
     # - samples_per_file=None: extracts ALL patches possible (one cutout centered on every object)
-    # - samples_per_file=10:   extracts 10 random object cutouts per FITS file
+    # - stretch_type="leakysb": default surface brightness transformation with identical RGB channels
     max_samples = 4  # Number of FITS files to match (or None for all 108 files)
     dataset = AstronomicalDataset.from_directories(
         images_dir=images_dir,
@@ -59,7 +59,7 @@ def main():
         samples_per_file=None,     # None = ALL patches possible across all objects!
         all_masks_in_crop=True,    # Trains on ALL masks present inside that cropped region!
         max_objects_per_crop=16,   # Cap to max 16 objects per crop to bound VRAM
-        stretch_type="asinh",
+        stretch_type="leakysb",    # Default: leakySB surface brightness stretch
         max_samples=max_samples,
     )
     print(f"  -> Extracted ALL {len(dataset)} possible multi-object patches from {max_samples} exposures!")
@@ -145,7 +145,7 @@ def main():
     res = segmentor.segment_points(
         image=test_patch,
         points=[(test_pt[0], test_pt[1])],
-        stretch_type="asinh",
+        stretch_type="leakysb",
         verbose=True,
     )
 

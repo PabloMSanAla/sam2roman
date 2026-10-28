@@ -5,13 +5,14 @@ Matplotlib visualization routines for astronomical FITS images and SAM 2 masks.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 
-from sam2roman.io.fits import FITSImage, stretch_astro_image
+if TYPE_CHECKING:
+    from sam2roman.io.fits import FITSImage
 
 
 def create_distinct_colormap(n_colors: int = 100, seed: int = 42) -> np.ndarray:
@@ -29,7 +30,7 @@ def plot_masks_overlay(
     masks: List[np.ndarray],
     boxes: Optional[List[List[float]]] = None,
     centroids: Optional[List[Tuple[float, float]]] = None,
-    stretch_type: str = "asinh",
+    stretch_type: str = "leakysb",
     alpha: float = 0.45,
     title: str = "SAM 2 Astronomical Segmentation Overlay",
     save_path: Optional[Union[str, Path]] = None,
@@ -49,8 +50,8 @@ def plot_masks_overlay(
         Optional bounding boxes to draw.
     centroids : Optional[List[Tuple[float, float]]]
         Optional centroids (x, y) to mark.
-    stretch_type : str, default 'asinh'
-        Astronomical stretch for 2D arrays.
+    stretch_type : str, default 'leakysb'
+        Astronomical stretch for 2D arrays ('leakysb', 'asinh', etc.).
     alpha : float, default 0.45
         Transparency of the mask overlay.
     title : str
@@ -60,6 +61,8 @@ def plot_masks_overlay(
     show_labels : bool, default True
         Whether to show numerical object ID labels near centroids.
     """
+    from sam2roman.io.fits import FITSImage, stretch_astro_image
+
     if isinstance(image, FITSImage):
         bg = stretch_astro_image(image.data, stretch_type=stretch_type)
     elif isinstance(image, np.ndarray):
@@ -145,12 +148,14 @@ def plot_detection_summary(
     2. SAM 2 segmentation overlay
     3. Object area distribution or integer segmentation label map
     """
+    from sam2roman.io.fits import FITSImage, stretch_astro_image
+
     if isinstance(image, FITSImage):
         data = image.data
     else:
         data = image
 
-    stretched = stretch_astro_image(data, stretch_type="asinh")
+    stretched = stretch_astro_image(data, stretch_type="leakysb")
     masks = seg_result.masks
 
     fig, axes = plt.subplots(1, 3, figsize=figsize)

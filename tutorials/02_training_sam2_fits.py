@@ -70,7 +70,7 @@ def main():
         stride=256,
         min_objects=2,
         prompt_type="point",  # 'point' or 'box'
-        stretch_type="asinh",
+        stretch_type="leakysb",
     )
     print(f"  -> Generated {len(full_dataset)} training tiles from 1 single master image!")
 
@@ -157,7 +157,7 @@ def main():
     res = fine_tuned_segmentor.segment_points(
         image=test_patch,
         points=[(test_pt[0], test_pt[1])],
-        stretch_type="asinh",
+        stretch_type="leakysb",
         verbose=True,
     )
     print(f"  -> Successfully predicted mask on test patch! Area: {res.areas[0]} px, Score: {res.scores[0]:.3f}")

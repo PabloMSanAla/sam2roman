@@ -71,7 +71,7 @@ def main():
         prompt_mode="astronomical",  # or 'grid'
         pred_iou_thresh=0.65,
         min_mask_region_area=12,    # Filter out hot pixels and cosmic rays
-        stretch_type="asinh",
+        stretch_type="leakysb",
         verbose=True,
     )
     print(f"  -> Successfully detected {len(results)} astronomical sources!")

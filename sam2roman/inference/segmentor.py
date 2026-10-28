@@ -161,7 +161,7 @@ class SAM2Segmentor:
     def _prepare_inputs(
         self,
         image: Union[FITSImage, np.ndarray, Image.Image, str, Path],
-        stretch_type: str = "asinh",
+        stretch_type: str = "leakysb",
     ) -> Tuple[Image.Image, Optional[FITSImage], Optional[np.ndarray]]:
         """
         Convert image input into a PIL RGB Image, extracting underlying FITS data and WCS.
@@ -213,7 +213,7 @@ class SAM2Segmentor:
         min_mask_region_area: int = 15,
         max_mask_region_area: Optional[int] = None,
         iou_overlap_thresh: float = 0.75,
-        stretch_type: str = "asinh",
+        stretch_type: str = "leakysb",
         verbose: bool = True,
     ) -> SegmentationResult:
         """
@@ -244,8 +244,8 @@ class SAM2Segmentor:
             Maximum pixel count (filters full-detector background masks).
         iou_overlap_thresh : float, default 0.75
             IoU threshold for deduplicating overlapping masks.
-        stretch_type : str, default 'asinh'
-            Intensity stretch for FITS conversion ('asinh', 'zscale', 'linear', 'log').
+        stretch_type : str, default 'leakysb'
+            Intensity stretch for FITS conversion ('leakysb', 'asinh', 'zscale', 'linear', 'log').
         verbose : bool, default True
             Whether to print detailed timing and progress diagnostics.
 
@@ -448,7 +448,7 @@ class SAM2Segmentor:
         image: Union[FITSImage, np.ndarray, Image.Image, str, Path],
         points: List[Tuple[float, float]],
         labels: Optional[List[int]] = None,
-        stretch_type: str = "asinh",
+        stretch_type: str = "leakysb",
         verbose: bool = False,
     ) -> SegmentationResult:
         """
