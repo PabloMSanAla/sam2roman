@@ -73,6 +73,12 @@ class SAM2Trainer:
         if self.freeze_vision_encoder:
             self._freeze_encoder()
 
+        # Optimize for modern NVIDIA GPUs (e.g. A100 / H100 with Ampere/Hopper Tensor Cores)
+        if self.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+
         # Trainable parameters
         self.trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
@@ -302,6 +308,8 @@ class SAM2Trainer:
         val_dataset: Optional[AstronomicalDataset] = None,
         output_dir: Optional[Union[str, Path]] = None,
         verbose: bool = True,
+        num_workers: int = 0,
+        pin_memory: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
         Run the complete fine-tuning routine.
@@ -313,17 +321,38 @@ class SAM2Trainer:
         epochs : int, default 5
             Number of training epochs.
         batch_size : int, default 2
-            Batch size of cropped images.
+            Batch size of cropped images. Set to 16–32 on NVIDIA A100 (40GB).
         val_dataset : AstronomicalDataset, optional
             Optional validation dataset.
         output_dir : str or Path, optional
             Directory to save checkpoints.
         verbose : bool, default True
             Print progress and metrics per epoch.
+        num_workers : int, default 0
+            Subprocesses for data loading. Set to 4+ on Colab A100 High-RAM to avoid CPU bottlenecks.
+        pin_memory : bool, optional
+            Pin memory in DataLoader for fast DMA transfers to GPU (defaults to True on CUDA).
         """
-        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=self.collate_fn)
+        if pin_memory is None:
+            pin_memory = (self.device.type == "cuda")
+
+        train_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=self.collate_fn,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
         val_loader = (
-            DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=self.collate_fn)
+            DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=self.collate_fn,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+            )
             if val_dataset is not None
             else None
         )
@@ -347,6 +376,9 @@ class SAM2Trainer:
                 val_multi_str = " (all masks in crop)" if is_val_multi else " (1 mask per crop)"
                 print(f"  -> Validation crops:     {len(val_dataset)}{val_multi_str}")
             print(f"  -> Prompt mode:          {self.prompt_type}")
+            print(f"  -> Batch size:           {batch_size}")
+            if num_workers > 0 or pin_memory:
+                print(f"  -> DataLoader:           num_workers={num_workers}, pin_memory={pin_memory}")
             print("-" * 65)
 
         for epoch in range(1, epochs + 1):

@@ -29,13 +29,15 @@ Interactive walkthroughs and reproducible examples for running and fine-tuning M
 
 ---
 
-### [Tutorial 03: Training from Paired Directories with Point Prompts](03_train_from_directories.ipynb)
+### [Tutorial 03: Training from Paired Directories with Point Prompts (A100 40GB Ready)](03_train_from_directories.ipynb)
 - **Files**: Notebook ([`03_train_from_directories.ipynb`](03_train_from_directories.ipynb)) and CLI script ([`03_train_from_directories.py`](03_train_from_directories.py))
 - **Key Concepts**:
   1. **Two Directories Setup**: Passing separate `images_dir` (`.../original/*.fits`) and `masks_dir` (`.../masks/*.fits`).
   2. **Point Prompts (`prompt_type='point'`)**: Training SAM 2 using foreground clicks instead of bounding boxes.
-  3. **On-the-Fly Object Cropping (`crop_size=512`)**: Extracting $512 \times 512$ patches around sources from full $4088 \times 4088$ exposures in 1ms using memory-mapped I/O.
-  4. **Low-Epoch Verification**: Fast fine-tuning on Apple Silicon MPS with convergence plots and test patch prediction.
+  3. **Multi-Mask Crops (`all_masks_in_crop=True`)**: Concurrently training on all source masks present inside each $512 \times 512$ cutout.
+  4. **NVIDIA A100 GPU (40GB) Resource Saturation**: Auto-detected high-throughput profile with batch size 16–32, TensorFloat-32 (TF32), native bfloat16 AMP, and multi-process DataLoader (`num_workers=4`, `pin_memory=True`).
+  5. **Default `leakySB` Stretch**: Surface brightness transformation preserving faint galaxy wings with identical RGB channels.
+  6. **Low-Epoch Verification & Inference**: Fast fine-tuning with live validation IoU and test patch segmentation.
 
 ---
 

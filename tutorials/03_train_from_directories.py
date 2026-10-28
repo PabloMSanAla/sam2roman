@@ -4,13 +4,15 @@ Tutorial 03: Training SAM 2 Using Paired FITS Images and Masks Directories
 ==========================================================================
 
 Demonstrates fine-tuning SAM 2 with:
-- Images directory: /Volumes/T7/storage/ROMAN/test/synthetic/original/
-- Masks directory:  /Volumes/T7/storage/ROMAN/test/synthetic/masks/
+- Paired directory ingestion: images and masks matching by filename
 - Point prompts instead of boxes (foreground object clicks)
 - Fast on-the-fly 512x512 cutout sampling from 4088x4088 detector exposures
+- Multi-mask per crop training with default leakySB stretch
+- NVIDIA A100 GPU (40GB VRAM) auto-detection, TF32 Tensor Cores, and high-throughput settings
 - Small epoch test run with validation metrics and checkpointing
 """
 
+import os
 from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,6 +31,58 @@ def main():
     base_dir = Path(__file__).resolve().parent
     output_dir = base_dir / "checkpoints"
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 0. Hardware Detection & A100 40GB Resource Configuration
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_bytes = torch.cuda.get_device_properties(0).total_memory
+        vram_gb = vram_bytes / (1024 ** 3)
+        cuda_cap = torch.cuda.get_device_capability(0)
+        num_cpus = os.cpu_count() or 4
+
+        print(f"\n[Hardware] Accelerator: {gpu_name}")
+        print(f"  -> Total VRAM:        {vram_gb:.2f} GB")
+        print(f"  -> Compute Cap:       {cuda_cap[0]}.{cuda_cap[1]}")
+        print(f"  -> System vCPUs:      {num_cpus}")
+
+        # Enable NVIDIA Ampere/Hopper TensorFloat-32 (TF32) for fast matmuls
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        print("  -> TF32 Tensor Cores: Enabled (allow_tf32=True)")
+        print(f"  -> bfloat16 Native:   {'Supported' if torch.cuda.is_bf16_supported() else 'No'}")
+
+        if vram_gb >= 35.0:
+            # Full A100 40GB throughput profile
+            batch_size = 16
+            num_workers = min(4, num_cpus)
+            pin_memory = True
+            epochs = 10
+            max_samples = None  # Process all Roman files on A100
+            print(f">> [Profile: A100 40GB High-Throughput] batch_size={batch_size}, num_workers={num_workers}")
+        elif vram_gb >= 20.0:
+            batch_size = 8
+            num_workers = min(2, num_cpus)
+            pin_memory = True
+            epochs = 5
+            max_samples = None
+            print(f">> [Profile: 24GB GPU] batch_size={batch_size}, num_workers={num_workers}")
+        else:
+            batch_size = 4
+            num_workers = min(2, num_cpus)
+            pin_memory = True
+            epochs = 3
+            max_samples = 4
+            print(f">> [Profile: 16GB GPU] batch_size={batch_size}, num_workers={num_workers}")
+    else:
+        device_name = "MPS (Apple Silicon)" if torch.backends.mps.is_available() else "CPU"
+        print(f"\n[Hardware] Device: {device_name}")
+        batch_size = 2
+        num_workers = 0
+        pin_memory = False
+        epochs = 3
+        max_samples = 4
+        print(f">> [Profile: Local/MPS] batch_size={batch_size}, num_workers={num_workers}")
 
     # 1. Target Directories
     images_dir = Path("/Volumes/T7/storage/ROMAN/test/synthetic/original")
@@ -49,7 +103,6 @@ def main():
     # - all_masks_in_crop=True: segments ALL objects inside each 512x512 crop simultaneously!
     # - samples_per_file=None: extracts ALL patches possible (one cutout centered on every object)
     # - stretch_type="leakysb": default surface brightness transformation with identical RGB channels
-    max_samples = 4  # Number of FITS files to match (or None for all 108 files)
     dataset = AstronomicalDataset.from_directories(
         images_dir=images_dir,
         masks_dir=masks_dir,
@@ -62,7 +115,7 @@ def main():
         stretch_type="leakysb",    # Default: leakySB surface brightness stretch
         max_samples=max_samples,
     )
-    print(f"  -> Extracted ALL {len(dataset)} possible multi-object patches from {max_samples} exposures!")
+    print(f"  -> Extracted ALL {len(dataset)} possible multi-object patches from {max_samples or 'all'} exposures!")
 
     # 3. Train / Validation Split (80% / 20%)
     n_train = max(1, int(0.8 * len(dataset)))
@@ -82,22 +135,30 @@ def main():
         weight_decay=1e-4,
         freeze_vision_encoder=True,  # Keep backbone frozen for fast adaptation
         prompt_type="point",
+        use_amp=True,                # Automatically uses bfloat16 on A100
     )
     print(f"  -> Accelerator:        {trainer.device}")
     print(f"  -> Trainable weights:  {sum(p.numel() for p in trainer.trainable_params):,} params")
 
-    # 5. Train for Small Epochs (e.g. 3 epochs)
-    epochs = 3
-    batch_size = 2
-    print(f"\n[Step 3] Training for {epochs} epochs (batch_size={batch_size})...")
+    # 5. Train with Resource-Aware Batch Size and Workers
+    print(f"\n[Step 3] Training for {epochs} epochs (batch_size={batch_size}, num_workers={num_workers})...")
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     history = trainer.train(
         dataset=train_ds,
         val_dataset=val_ds,
         epochs=epochs,
         batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         output_dir=output_dir,
         verbose=True,
     )
+
+    if torch.cuda.is_available():
+        peak_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        print(f"\n[A100 Resource Stats] Peak VRAM: {peak_vram:.2f} GB / {vram_gb:.1f} GB ({peak_vram/vram_gb*100:.1f}%)")
 
     # 6. Plot Loss and Validation Curves
     curve_path = base_dir / "03_directory_training_curves.png"

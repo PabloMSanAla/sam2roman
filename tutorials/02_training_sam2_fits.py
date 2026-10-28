@@ -9,9 +9,11 @@ This script demonstrates how to train/fine-tune SAM 2 using:
 3. Freezing the Hiera vision backbone to preserve pre-trained features and save memory.
 4. Training the prompt encoder and mask decoder with Combined BCE + Dice Loss.
 5. Evaluating validation loss and validation IoU per epoch.
-6. Saving checkpoints and running inference with the fine-tuned model.
+6. A100 GPU (40GB) auto-detection, TF32 Tensor Cores, and high-throughput settings.
+7. Saving checkpoints and running inference with the fine-tuned model and default leakySB stretch.
 """
 
+import os
 from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
@@ -36,6 +38,52 @@ def main():
     data_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Hardware detection & A100 40GB resource scaling
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_bytes = torch.cuda.get_device_properties(0).total_memory
+        vram_gb = vram_bytes / (1024 ** 3)
+        cuda_cap = torch.cuda.get_device_capability(0)
+        num_cpus = os.cpu_count() or 4
+
+        print(f"\n[Hardware] Accelerator: {gpu_name}")
+        print(f"  -> Total VRAM:        {vram_gb:.2f} GB")
+        print(f"  -> Compute Cap:       {cuda_cap[0]}.{cuda_cap[1]}")
+        print(f"  -> System vCPUs:      {num_cpus}")
+
+        # Enable TF32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        print("  -> TF32 Tensor Cores: Enabled (allow_tf32=True)")
+
+        if vram_gb >= 35.0:
+            batch_size = 16
+            num_workers = min(4, num_cpus)
+            pin_memory = True
+            epochs = 10
+            print(f">> [Profile: A100 40GB High-Throughput] batch_size={batch_size}, num_workers={num_workers}")
+        elif vram_gb >= 20.0:
+            batch_size = 8
+            num_workers = min(2, num_cpus)
+            pin_memory = True
+            epochs = 5
+            print(f">> [Profile: 24GB GPU] batch_size={batch_size}, num_workers={num_workers}")
+        else:
+            batch_size = 4
+            num_workers = min(2, num_cpus)
+            pin_memory = True
+            epochs = 4
+            print(f">> [Profile: 16GB GPU] batch_size={batch_size}, num_workers={num_workers}")
+    else:
+        device_name = "MPS (Apple Silicon)" if torch.backends.mps.is_available() else "CPU"
+        print(f"\n[Hardware] Device: {device_name}")
+        batch_size = 2
+        num_workers = 0
+        pin_memory = False
+        epochs = 4
+        print(f">> [Profile: Local/MPS] batch_size={batch_size}, num_workers={num_workers}")
+
     master_fits_path = data_dir / "sample_roman_train_field.fits"
 
     # Step 1: Create or Load Master Astronomical Image + Ground Truth SegMap
@@ -53,7 +101,6 @@ def main():
     else:
         fits_img = FITSImage.from_file(master_fits_path)
         image_data = fits_img.data
-        # Generate synthetic segmap if loading existing file without SEGMAP
         _, _, catalog, gt_segmap = generate_synthetic_roman_fits(
             shape=(1024, 1024), n_stars=60, n_galaxies=35, seed=42
         )
@@ -88,26 +135,34 @@ def main():
     print(f"\n[Step 4] Configuring SAM2Trainer with '{model_id}'...")
     trainer = SAM2Trainer(
         model_id=model_id,
-        learning_rate=1e-4,       # Standard AdamW learning rate for mask decoder
-        weight_decay=1e-4,        # L2 Regularization
+        learning_rate=1e-4,          # Standard AdamW learning rate for mask decoder
+        weight_decay=1e-4,           # L2 Regularization
         freeze_vision_encoder=True,  # FREEZE heavy Hiera backbone to preserve representations
         prompt_type="point",
+        use_amp=True,                # Uses native bfloat16 on A100
     )
     print(f"  -> Execution Device:   {trainer.device}")
     print(f"  -> Trainable weights:  {sum(p.numel() for p in trainer.trainable_params):,} parameters")
 
     # Step 5: Execute Training Loop
-    epochs = 4
-    batch_size = 2
-    print(f"\n[Step 5] Launching fine-tuning for {epochs} epochs (batch_size={batch_size})...")
+    print(f"\n[Step 5] Launching fine-tuning for {epochs} epochs (batch_size={batch_size}, num_workers={num_workers})...")
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     history = trainer.train(
         dataset=train_dataset,
         val_dataset=val_dataset,
         epochs=epochs,
         batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         output_dir=output_dir,
         verbose=True,
     )
+
+    if torch.cuda.is_available():
+        peak_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        print(f"\n[A100 Resource Stats] Peak VRAM: {peak_vram:.2f} GB / {vram_gb:.1f} GB ({peak_vram/vram_gb*100:.1f}%)")
 
     # Step 6: Plot Training & Validation Loss Curves
     loss_curve_path = base_dir / "02_training_curves.png"
@@ -148,19 +203,21 @@ def main():
     test_pt = val_sample["point"][0].tolist()
 
     # Load fine-tuned weights into segmentor
-    fine_tuned_segmentor = SAM2Segmentor(model_id=model_id)
-    fine_tuned_segmentor.model_wrapper.model.load_state_dict(
+    segmentor = SAM2Segmentor(model_id=model_id)
+    segmentor.model_wrapper.model.load_state_dict(
         torch.load(best_ckpt, map_location=trainer.device)["model_state_dict"]
     )
-    fine_tuned_segmentor.model_wrapper.model.eval()
+    segmentor.model_wrapper.model.eval()
 
-    res = fine_tuned_segmentor.segment_points(
+    res = segmentor.segment_points(
         image=test_patch,
         points=[(test_pt[0], test_pt[1])],
         stretch_type="leakysb",
         verbose=True,
     )
-    print(f"  -> Successfully predicted mask on test patch! Area: {res.areas[0]} px, Score: {res.scores[0]:.3f}")
+
+    if res.masks:
+        print(f"  -> Prediction successful! Mask Area: {res.areas[0]} px, Score: {res.scores[0]:.3f}")
 
     print("\n" + "=" * 70)
     print("   Tutorial 02 Completed Successfully!   ")
