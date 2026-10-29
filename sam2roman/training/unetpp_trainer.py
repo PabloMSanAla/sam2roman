@@ -19,6 +19,8 @@ from torch.utils.data import DataLoader
 from sam2roman.models.unetpp import UNetPlusPlus
 from sam2roman.training.losses import MultiClassCombinedLoss
 from sam2roman.training.dataset import AstronomicalDataset
+from sam2roman.training.gpu_transforms import GPUAstroTransform
+from sam2roman.training.webdataset_loader import create_webdataset_loader
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +68,7 @@ class UNetPPTrainer:
         learning_rate: float = 3e-4,
         weight_decay: float = 1e-4,
         class_weights: Optional[Union[Tuple[float, ...], List[float], torch.Tensor]] = None,
+        gpu_transform: Optional[Union[nn.Module, bool]] = True,
         device: Optional[Union[str, torch.device]] = None,
     ):
         if device is None:
@@ -127,6 +130,14 @@ class UNetPPTrainer:
         self.scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None
         self.learning_rate = learning_rate
 
+        # GPU-Accelerated Astronomical Transforms (leakySB + noise/spatial augmentations)
+        if isinstance(gpu_transform, nn.Module):
+            self.gpu_transform = gpu_transform.to(self.device)
+        elif gpu_transform is True:
+            self.gpu_transform = GPUAstroTransform().to(self.device)
+        else:
+            self.gpu_transform = None
+
     @staticmethod
     def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Collate batches for UNet++ (stacks image and target tensors)."""
@@ -145,12 +156,24 @@ class UNetPPTrainer:
     def train_epoch(self, dataloader: DataLoader) -> float:
         """Run one training epoch."""
         self.model.train()
+        if self.gpu_transform is not None:
+            self.gpu_transform.train()
         total_loss = 0.0
         steps = 0
 
         for batch in dataloader:
-            images = batch["image"].to(self.device, non_blocking=True)
-            targets = batch["target"].to(self.device, non_blocking=True)
+            if "image" in batch:
+                images = batch["image"].to(self.device, non_blocking=True)
+                targets = batch["target"].to(self.device, non_blocking=True)
+            elif "raw" in batch:
+                raw = batch["raw"].to(self.device, non_blocking=True)
+                targets = batch["target"].to(self.device, non_blocking=True)
+                if self.gpu_transform is not None:
+                    images, targets = self.gpu_transform(raw, targets)
+                else:
+                    images = raw
+            else:
+                raise KeyError(f"Expected 'image' or 'raw' key in batch, got {list(batch.keys())}")
 
             self.optimizer.zero_grad()
 
@@ -183,6 +206,8 @@ class UNetPPTrainer:
         Returns: (val_loss, macro_iou, interior_iou, boundary_iou)
         """
         self.model.eval()
+        if self.gpu_transform is not None:
+            self.gpu_transform.eval()
         total_loss = 0.0
         steps = 0
 
@@ -192,8 +217,18 @@ class UNetPPTrainer:
 
         with torch.no_grad():
             for batch in dataloader:
-                images = batch["image"].to(self.device, non_blocking=True)
-                targets = batch["target"].to(self.device, non_blocking=True)
+                if "image" in batch:
+                    images = batch["image"].to(self.device, non_blocking=True)
+                    targets = batch["target"].to(self.device, non_blocking=True)
+                elif "raw" in batch:
+                    raw = batch["raw"].to(self.device, non_blocking=True)
+                    targets = batch["target"].to(self.device, non_blocking=True)
+                    if self.gpu_transform is not None:
+                        images, targets = self.gpu_transform(raw, targets)
+                    else:
+                        images = raw
+                else:
+                    raise KeyError(f"Expected 'image' or 'raw' key in batch, got {list(batch.keys())}")
 
                 if self.use_amp:
                     with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
@@ -238,10 +273,10 @@ class UNetPPTrainer:
 
     def train(
         self,
-        dataset: AstronomicalDataset,
+        dataset: Union[AstronomicalDataset, DataLoader, str, Path],
         epochs: int = 10,
         batch_size: int = 8,
-        val_dataset: Optional[AstronomicalDataset] = None,
+        val_dataset: Optional[Union[AstronomicalDataset, DataLoader, str, Path]] = None,
         output_dir: Optional[Union[str, Path]] = None,
         verbose: bool = True,
         num_workers: int = 0,
@@ -253,14 +288,15 @@ class UNetPPTrainer:
 
         Parameters
         ----------
-        dataset : AstronomicalDataset
-            Training dataset (with target_mode='dense_3class').
+        dataset : AstronomicalDataset, DataLoader, str, or Path
+            Training dataset: can be an AstronomicalDataset, an active DataLoader (e.g. WebDataset),
+            or a path/glob string pointing to WebDataset (.tar) shards.
         epochs : int, default 10
             Number of training epochs.
         batch_size : int, default 8
-            Mini-batch size (can be set to 16–48 on A100 40GB).
-        val_dataset : AstronomicalDataset, optional
-            Optional validation dataset.
+            Mini-batch size (can be set to 16–64 on Grace Hopper H100 or A100).
+        val_dataset : AstronomicalDataset, DataLoader, str, or Path, optional
+            Optional validation dataset, loader, or WebDataset shard path.
         output_dir : str or Path, optional
             Directory to save checkpoints.
         verbose : bool, default True
@@ -282,16 +318,42 @@ class UNetPPTrainer:
             eta_min=self.learning_rate * 0.05,
         )
 
-        train_loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            collate_fn=self.collate_fn,
-        )
-        val_loader = (
-            DataLoader(
+        # Build or wrap train DataLoader
+        if isinstance(dataset, DataLoader):
+            train_loader = dataset
+        elif isinstance(dataset, (str, Path)):
+            train_loader = create_webdataset_loader(
+                urls=dataset,
+                batch_size=batch_size,
+                is_train=True,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+            )
+        else:
+            train_loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                collate_fn=self.collate_fn,
+            )
+
+        # Build or wrap validation DataLoader
+        if val_dataset is None:
+            val_loader = None
+        elif isinstance(val_dataset, DataLoader):
+            val_loader = val_dataset
+        elif isinstance(val_dataset, (str, Path)):
+            val_loader = create_webdataset_loader(
+                urls=val_dataset,
+                batch_size=batch_size,
+                is_train=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+            )
+        else:
+            val_loader = DataLoader(
                 val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
@@ -299,9 +361,6 @@ class UNetPPTrainer:
                 pin_memory=pin_memory,
                 collate_fn=self.collate_fn,
             )
-            if val_dataset is not None
-            else None
-        )
 
         history: Dict[str, List[float]] = {
             "train_loss": [],
@@ -314,13 +373,20 @@ class UNetPPTrainer:
         best_val_loss = float("inf")
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
+        n_train_str = f"{len(dataset):,}" if hasattr(dataset, "__len__") else "Streaming WebDataset"
+        n_val_str = (
+            f"{len(val_dataset):,}"
+            if (val_dataset is not None and hasattr(val_dataset, "__len__"))
+            else ("Streaming WebDataset" if val_dataset is not None else "None")
+        )
+
         if verbose:
             print(f"[sam2roman] Starting UNet++ training for {epochs} epochs on {self.device}...")
             print(f"  -> Model Architecture:  UNet++ (Nested U-Net, 3 classes: bg, interior, boundary)")
             print(f"  -> Trainable weights:   {trainable_params:,} parameters")
-            print(f"  -> Training cutouts:    {len(dataset)}")
-            if val_dataset:
-                print(f"  -> Validation cutouts:  {len(val_dataset)}")
+            print(f"  -> Training cutouts:    {n_train_str}")
+            if val_dataset is not None:
+                print(f"  -> Validation cutouts:  {n_val_str}")
             print(f"  -> Batch size:          {batch_size}")
             print(f"  -> DataLoader:          shuffle={shuffle}, num_workers={num_workers}, pin_memory={pin_memory}")
             if self.device.type == "cuda":
