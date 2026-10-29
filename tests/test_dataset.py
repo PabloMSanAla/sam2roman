@@ -124,3 +124,37 @@ def test_leakysb_default_and_rgb_identical_channels():
     assert pil_arr.shape == (128, 128, 3)
     np.testing.assert_array_equal(pil_arr[..., 0], pil_arr[..., 1])
     np.testing.assert_array_equal(pil_arr[..., 1], pil_arr[..., 2])
+
+
+def test_centered_point_prompt():
+    img = np.ones((100, 100), dtype=np.float32) * 5.0
+    mask = np.zeros((100, 100), dtype=np.int32)
+    # Square object from y: 30..50, x: 40..60
+    # Mean y = 39.5, Mean x = 49.5
+    mask[30:50, 40:60] = 1
+
+    ds = AstronomicalDataset(
+        images=[img],
+        masks=[mask],
+        point_prompt_mode="center",
+    )
+    sample = ds[0]
+    pt = sample["point"][0].tolist()
+    assert abs(pt[0] - 49.5) < 1e-4
+    assert abs(pt[1] - 39.5) < 1e-4
+
+    # Verify for concave/ring mask where centroid is in empty space
+    ring_mask = np.zeros((100, 100), dtype=np.int32)
+    ring_mask[40:60, 40:60] = 1
+    ring_mask[45:55, 45:55] = 0  # Hole in the middle!
+    ds_ring = AstronomicalDataset(
+        images=[img],
+        masks=[ring_mask],
+        point_prompt_mode="center",
+    )
+    sample_ring = ds_ring[0]
+    pt_ring = sample_ring["point"][0].tolist()
+    # Ensure point is inside the actual ring mask (not in the hole)
+    px, py = int(round(pt_ring[0])), int(round(pt_ring[1]))
+    assert ring_mask[py, px] == 1
+

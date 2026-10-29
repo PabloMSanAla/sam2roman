@@ -310,6 +310,7 @@ class SAM2Trainer:
         verbose: bool = True,
         num_workers: int = 0,
         pin_memory: Optional[bool] = None,
+        shuffle: bool = True,
     ) -> Dict[str, Any]:
         """
         Run the complete fine-tuning routine.
@@ -332,6 +333,9 @@ class SAM2Trainer:
             Subprocesses for data loading. Set to 4+ on Colab A100 High-RAM to avoid CPU bottlenecks.
         pin_memory : bool, optional
             Pin memory in DataLoader for fast DMA transfers to GPU (defaults to True on CUDA).
+        shuffle : bool, default True
+            Whether to shuffle training crops each epoch. Highly recommended (True) to break batch-order
+            correlations, avoid cyclic bias, and ensure smooth AdamW convergence.
         """
         if pin_memory is None:
             pin_memory = (self.device.type == "cuda")
@@ -339,7 +343,7 @@ class SAM2Trainer:
         train_loader = DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=shuffle,
             collate_fn=self.collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory,
@@ -377,8 +381,7 @@ class SAM2Trainer:
                 print(f"  -> Validation crops:     {len(val_dataset)}{val_multi_str}")
             print(f"  -> Prompt mode:          {self.prompt_type}")
             print(f"  -> Batch size:           {batch_size}")
-            if num_workers > 0 or pin_memory:
-                print(f"  -> DataLoader:           num_workers={num_workers}, pin_memory={pin_memory}")
+            print(f"  -> DataLoader:           shuffle={shuffle}, num_workers={num_workers}, pin_memory={pin_memory}")
             print("-" * 65)
 
         for epoch in range(1, epochs + 1):

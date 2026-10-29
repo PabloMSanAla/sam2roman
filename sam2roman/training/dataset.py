@@ -41,6 +41,10 @@ class AstronomicalDataset(Dataset):
         Astronomical stretch for FITS conversion ('leakysb', 'asinh', 'zscale', 'linear', 'log', 'sqrt').
     prompt_type : str, default 'point'
         Type of training prompt: 'point', 'box', or 'both'.
+    point_prompt_mode : str, default 'center'
+        Strategy for sampling point prompts:
+        - 'center': Deterministic geometric centroid of the mask (or closest foreground pixel for concave/ring shapes).
+        - 'random': Randomly picks a foreground pixel inside the mask.
     crop_size : Optional[int], default None
         If specified (e.g. 512), crops a window around a target object.
     samples_per_file : Optional[Union[int, str]], default None
@@ -73,6 +77,7 @@ class AstronomicalDataset(Dataset):
         masks: List[Union[str, Path, np.ndarray]],
         stretch_type: str = "leakysb",
         prompt_type: str = "point",
+        point_prompt_mode: str = "center",
         crop_size: Optional[int] = None,
         samples_per_file: Optional[Union[int, str]] = None,
         all_masks_in_crop: bool = True,
@@ -92,6 +97,7 @@ class AstronomicalDataset(Dataset):
         self.masks = masks
         self.stretch_type = stretch_type
         self.prompt_type = prompt_type
+        self.point_prompt_mode = point_prompt_mode.lower()
         self.crop_size = crop_size
         self.samples_per_file = samples_per_file
         self.all_masks_in_crop = all_masks_in_crop
@@ -150,6 +156,7 @@ class AstronomicalDataset(Dataset):
         max_objects_per_crop: Optional[int] = None,
         min_object_pixels: int = 4,
         prompt_type: str = "point",
+        point_prompt_mode: str = "center",
         stretch_type: str = "leakysb",
         zero_points: float = 31.4,
         pixel_scale: float = 0.11,
@@ -231,6 +238,7 @@ class AstronomicalDataset(Dataset):
             masks=matched_masks,
             stretch_type=stretch_type,
             prompt_type=prompt_type,
+            point_prompt_mode=point_prompt_mode,
             crop_size=crop_size,
             samples_per_file=samples_per_file,
             all_masks_in_crop=all_masks_in_crop,
@@ -255,6 +263,7 @@ class AstronomicalDataset(Dataset):
         min_object_pixels: int = 4,
         stretch_type: str = "leakysb",
         prompt_type: str = "point",
+        point_prompt_mode: str = "center",
         zero_points: float = 31.4,
         pixel_scale: float = 0.11,
         mmin: float = 13.0,
@@ -300,6 +309,7 @@ class AstronomicalDataset(Dataset):
             masks=tiles_mask,
             stretch_type=stretch_type,
             prompt_type=prompt_type,
+            point_prompt_mode=point_prompt_mode,
             all_masks_in_crop=all_masks_in_crop,
             max_objects_per_crop=max_objects_per_crop,
             min_object_pixels=min_object_pixels,
@@ -431,8 +441,25 @@ class AstronomicalDataset(Dataset):
             for lbl in valid_labels:
                 obj_mask = (crop_raw_mask == lbl).astype(np.float32)
                 ys, xs = np.where(obj_mask > 0)
-                pt_idx = np.random.randint(0, len(xs))
-                point = [float(xs[pt_idx]), float(ys[pt_idx])]
+
+                # Point prompt selection: centered in mask (default) or random pixel
+                if self.point_prompt_mode == "center":
+                    cx = float(np.mean(xs))
+                    cy = float(np.mean(ys))
+                    cx_int = int(np.clip(np.round(cx), 0, obj_mask.shape[1] - 1))
+                    cy_int = int(np.clip(np.round(cy), 0, obj_mask.shape[0] - 1))
+                    if obj_mask[cy_int, cx_int] > 0:
+                        point = [cx, cy]
+                    else:
+                        # For concave / ring objects where geometric centroid falls in a void,
+                        # choose the mask pixel closest to the centroid
+                        dists = (xs - cx) ** 2 + (ys - cy) ** 2
+                        best_idx = int(np.argmin(dists))
+                        point = [float(xs[best_idx]), float(ys[best_idx])]
+                else:
+                    pt_idx = np.random.randint(0, len(xs))
+                    point = [float(xs[pt_idx]), float(ys[pt_idx])]
+
                 label = 1
 
                 x_min, x_max = float(np.min(xs)), float(np.max(xs))
