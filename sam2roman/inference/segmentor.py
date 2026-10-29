@@ -151,12 +151,79 @@ class SAM2Segmentor:
         self,
         model_wrapper: Optional[SAM2ModelWrapper] = None,
         model_id: str = DEFAULT_SAM2_MODEL,
+        checkpoint_path: Optional[Union[str, Path]] = None,
         device: Optional[Union[str, torch.device]] = None,
     ):
         if model_wrapper is not None:
             self.model_wrapper = model_wrapper
+        elif checkpoint_path is not None:
+            ckpt_path = Path(checkpoint_path)
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            ckpt_model_id = ckpt.get("model_id", model_id)
+            self.model_wrapper = SAM2ModelWrapper(model_id=ckpt_model_id, device=device)
+            self.model_wrapper.model.load_state_dict(ckpt["model_state_dict"])
+            self.model_wrapper.model.eval()
+            logger.info(f"Loaded fine-tuned checkpoint from '{ckpt_path}' (model_id: {ckpt_model_id}) on {self.model_wrapper.device}")
         else:
             self.model_wrapper = SAM2ModelWrapper(model_id=model_id, device=device)
+
+        if checkpoint_path is not None and model_wrapper is not None:
+            self.load_checkpoint(checkpoint_path)
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path: Union[str, Path],
+        device: Optional[Union[str, torch.device]] = None,
+        model_id: Optional[str] = None,
+    ) -> "SAM2Segmentor":
+        """
+        Instantiate SAM2Segmentor directly from a fine-tuned training checkpoint.
+
+        Parameters
+        ----------
+        checkpoint_path : str or Path
+            Path to the saved checkpoint file (e.g. 'checkpoints/checkpoint_best.pt').
+        device : str or torch.device, optional
+            Target accelerator ('cuda', 'mps', 'cpu'). Auto-detected if None.
+        model_id : str, optional
+            Base model ID. If None, auto-detected from checkpoint metadata.
+        """
+        ckpt_path = Path(checkpoint_path)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
+
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        target_model_id = model_id or ckpt.get("model_id", DEFAULT_SAM2_MODEL)
+
+        wrapper = SAM2ModelWrapper(model_id=target_model_id, device=device)
+        wrapper.model.load_state_dict(ckpt["model_state_dict"])
+        wrapper.model.eval()
+
+        logger.info(
+            f"Initialized fine-tuned SAM2Segmentor from '{ckpt_path.name}' (model: {target_model_id}) on {wrapper.device}"
+        )
+        return cls(model_wrapper=wrapper)
+
+    def load_checkpoint(self, checkpoint_path: Union[str, Path]) -> None:
+        """
+        Load fine-tuned model state_dict from a checkpoint into the active segmentor.
+
+        Parameters
+        ----------
+        checkpoint_path : str or Path
+            Path to the checkpoint file.
+        """
+        ckpt_path = Path(checkpoint_path)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
+
+        checkpoint = torch.load(ckpt_path, map_location=self.model_wrapper.device)
+        self.model_wrapper.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model_wrapper.model.eval()
+        logger.info(f"Loaded fine-tuned checkpoint into SAM2Segmentor: {ckpt_path}")
 
     def _prepare_inputs(
         self,

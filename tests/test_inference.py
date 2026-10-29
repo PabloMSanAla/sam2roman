@@ -35,3 +35,30 @@ def test_segmentation_result_filtering():
     comb = res.to_combined_mask()
     assert comb.shape == (32, 32)
     assert np.max(comb) == 2
+
+
+def test_segmentor_from_checkpoint(tmp_path):
+    from sam2roman.inference.segmentor import SAM2Segmentor
+    import torch
+
+    # Create dummy checkpoint
+    ckpt_file = tmp_path / "dummy_checkpoint.pt"
+    # Create a small dummy state_dict
+    segmentor_init = SAM2Segmentor(device="cpu")
+    torch.save(
+        {
+            "model_state_dict": segmentor_init.model_wrapper.model.state_dict(),
+            "model_id": "facebook/sam2.1-hiera-tiny",
+        },
+        ckpt_file,
+    )
+
+    # Load using classmethod
+    seg_from_ckpt = SAM2Segmentor.from_checkpoint(ckpt_file, device="cpu")
+    assert seg_from_ckpt.model_wrapper is not None
+    assert seg_from_ckpt.model_wrapper.model is not None
+
+    # Load using __init__ checkpoint_path
+    seg_init_ckpt = SAM2Segmentor(checkpoint_path=ckpt_file, device="cpu")
+    assert seg_init_ckpt.model_wrapper is not None
+

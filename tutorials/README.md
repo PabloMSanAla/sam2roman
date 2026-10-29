@@ -41,6 +41,18 @@ Interactive walkthroughs and reproducible examples for running and fine-tuning M
 
 ---
 
+### [Tutorial 04: Segment Everything with Fine-Tuned Checkpoints](04_segment_everything_finetuned.ipynb)
+- **Files**: Notebook ([`04_segment_everything_finetuned.ipynb`](04_segment_everything_finetuned.ipynb)) and CLI script ([`04_segment_everything_finetuned.py`](04_segment_everything_finetuned.py))
+- **Key Concepts**:
+  1. **Checkpoint Ingestion**: Loading fine-tuned prompt encoder and mask decoder weights from `checkpoint_best.pt` via `SAM2Segmentor.from_checkpoint()`.
+  2. **Promptless Automatic Mask Generation**: Running `segment_everything()` across an entire FITS exposure using fine-tuned weights.
+  3. **Prompt Modes**: Comparing `astronomical` (fast candidate peak detection) and `grid` (dense query lattice).
+  4. **Decoupled Source Photometry**: Measuring net flux, SNR, centroid, and half-light radius on all segmented sources.
+  5. **Visualizations**: Generating 3-panel detection summaries and colorful mask overlays.
+  6. **Export**: Writing labeled masks to multi-extension FITS with a standard `SEGMAP` HDU.
+
+---
+
 ## Running the Tutorials
 
 ### Method 1: Interactive JupyterLab
@@ -63,4 +75,7 @@ python tutorials/02_training_sam2_fits.py
 
 # Run Tutorial 03 (Fine-Tuning from Paired Directories with Point Prompts)
 python tutorials/03_train_from_directories.py
+
+# Run Tutorial 04 (Segment Everything with Fine-Tuned Checkpoints)
+python tutorials/04_segment_everything_finetuned.py
 ```
