@@ -72,3 +72,72 @@ class CombinedSegmentationLoss(nn.Module):
         bce = self.bce_loss(pred_logits, targets.float())
         dice = self.dice_loss(pred_logits, targets)
         return self.bce_weight * bce + self.dice_weight * dice
+
+
+class MultiClassCombinedLoss(nn.Module):
+    """
+    Combined Cross-Entropy and Multi-Class Dice Loss for boundary-aware UNet++ training.
+
+    Parameters
+    ----------
+    class_weights : Optional[torch.Tensor]
+        Optional class weighting for CrossEntropy (e.g. [1.0, 2.5, 4.0] for bg, interior, edge).
+    ce_weight : float, default 1.0
+        Weight factor for CrossEntropy loss.
+    dice_weight : float, default 1.0
+        Weight factor for Dice loss.
+    smooth : float, default 1.0
+        Laplace smoothing term for Dice calculation.
+    """
+
+    def __init__(
+        self,
+        class_weights: Optional[torch.Tensor] = None,
+        ce_weight: float = 1.0,
+        dice_weight: float = 1.0,
+        smooth: float = 1.0,
+    ):
+        super().__init__()
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.smooth = smooth
+        self.register_buffer("class_weights", class_weights)
+        self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
+
+    def forward(
+        self,
+        pred_logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute combined loss.
+
+        Parameters
+        ----------
+        pred_logits : torch.Tensor
+            Logits of shape (B, num_classes, H, W).
+        targets : torch.Tensor
+            Ground truth class labels of shape (B, H, W) with dtype int64.
+        """
+        # CrossEntropy
+        ce = self.ce_loss(pred_logits, targets)
+
+        # Multi-class Dice
+        probs = F.softmax(pred_logits, dim=1)
+        num_classes = pred_logits.shape[1]
+
+        # One-hot encode targets to (B, num_classes, H, W)
+        targets_one_hot = (
+            F.one_hot(targets, num_classes=num_classes)
+            .permute(0, 3, 1, 2)
+            .float()
+        )
+
+        dims = (0, 2, 3)
+        intersection = torch.sum(probs * targets_one_hot, dim=dims)
+        cardinality = torch.sum(probs + targets_one_hot, dim=dims)
+        dice_per_class = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
+        dice_loss = 1.0 - torch.mean(dice_per_class)
+
+        return self.ce_weight * ce + self.dice_weight * dice_loss
+

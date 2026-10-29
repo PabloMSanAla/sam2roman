@@ -16,6 +16,7 @@ from astropy.io import fits
 from scipy.ndimage import center_of_mass
 
 from sam2roman.io.fits import FITSImage, stretch_astro_image
+from sam2roman.training.boundary import generate_3class_boundary_mask
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ class AstronomicalDataset(Dataset):
         stretch_type: str = "leakysb",
         prompt_type: str = "point",
         point_prompt_mode: str = "center",
+        target_mode: str = "instance",
         crop_size: Optional[int] = None,
         samples_per_file: Optional[Union[int, str]] = None,
         all_masks_in_crop: bool = True,
@@ -98,6 +100,7 @@ class AstronomicalDataset(Dataset):
         self.stretch_type = stretch_type
         self.prompt_type = prompt_type
         self.point_prompt_mode = point_prompt_mode.lower()
+        self.target_mode = target_mode.lower()
         self.crop_size = crop_size
         self.samples_per_file = samples_per_file
         self.all_masks_in_crop = all_masks_in_crop
@@ -157,6 +160,7 @@ class AstronomicalDataset(Dataset):
         min_object_pixels: int = 4,
         prompt_type: str = "point",
         point_prompt_mode: str = "center",
+        target_mode: str = "instance",
         stretch_type: str = "leakysb",
         zero_points: float = 31.4,
         pixel_scale: float = 0.11,
@@ -239,6 +243,7 @@ class AstronomicalDataset(Dataset):
             stretch_type=stretch_type,
             prompt_type=prompt_type,
             point_prompt_mode=point_prompt_mode,
+            target_mode=target_mode,
             crop_size=crop_size,
             samples_per_file=samples_per_file,
             all_masks_in_crop=all_masks_in_crop,
@@ -264,6 +269,7 @@ class AstronomicalDataset(Dataset):
         stretch_type: str = "leakysb",
         prompt_type: str = "point",
         point_prompt_mode: str = "center",
+        target_mode: str = "instance",
         zero_points: float = 31.4,
         pixel_scale: float = 0.11,
         mmin: float = 13.0,
@@ -310,6 +316,7 @@ class AstronomicalDataset(Dataset):
             stretch_type=stretch_type,
             prompt_type=prompt_type,
             point_prompt_mode=point_prompt_mode,
+            target_mode=target_mode,
             all_masks_in_crop=all_masks_in_crop,
             max_objects_per_crop=max_objects_per_crop,
             min_object_pixels=min_object_pixels,
@@ -384,6 +391,32 @@ class AstronomicalDataset(Dataset):
         else:
             data_patch = raw_data
             crop_raw_mask = raw_mask
+
+        # Fast path for dense 3-class semantic segmentation (UNet++)
+        if self.target_mode == "dense_3class":
+            norm = stretch_astro_image(
+                data_patch,
+                stretch_type=self.stretch_type,
+                zero_points=self.zero_points,
+                pixel_scale=self.pixel_scale,
+                mmin=self.mmin,
+                mmax=self.mmax,
+            )
+            rgb_uint8 = (norm * 255.0).astype(np.uint8)
+            rgb_3ch = np.stack([rgb_uint8, rgb_uint8, rgb_uint8], axis=-1)
+            image_tensor = torch.from_numpy(rgb_3ch).permute(2, 0, 1).float() / 255.0
+            pil_image = Image.fromarray(rgb_3ch, mode="RGB")
+
+            target_3class = generate_3class_boundary_mask(crop_raw_mask)
+            target_tensor = torch.from_numpy(target_3class).long()  # (H, W)
+
+            return {
+                "image": image_tensor,
+                "target": target_tensor,
+                "pil_image": pil_image,
+                "raw_data": data_patch,
+                "raw_mask": crop_raw_mask,
+            }
 
         masks_list = []
         points_list = []

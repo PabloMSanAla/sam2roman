@@ -53,6 +53,16 @@ Interactive walkthroughs and reproducible examples for running and fine-tuning M
 
 ---
 
+### [Tutorial 05: Boundary-Aware UNet++ Training & Deblending](05_train_unetplusplus.ipynb)
+- **Files**: Notebook ([`05_train_unetplusplus.ipynb`](05_train_unetplusplus.ipynb)) and CLI script ([`05_train_unetplusplus.py`](05_train_unetplusplus.py))
+- **Key Concepts**:
+  1. **3-Class Boundary Targets**: Training on Background (0), Source Interior (1), and Source Boundary/Edge (2).
+  2. **Ultra-Fast Prompt-Free Inference**: Single forward pass in $<15$ ms with zero prompt clicks.
+  3. **Touching Instance Deblending**: Using predicted interior cores and boundary channels with marker-controlled watershed to cleanly split overlapping sources.
+  4. **Automatic Hardware Optimization**: Auto-detects Apple Silicon MPS (FP32) or NVIDIA CUDA (TF32, bfloat16 AMP, pinned memory).
+
+---
+
 ## Running the Tutorials
 
 ### Method 1: Interactive JupyterLab
@@ -78,4 +88,7 @@ python tutorials/03_train_from_directories.py
 
 # Run Tutorial 04 (Segment Everything with Fine-Tuned Checkpoints)
 python tutorials/04_segment_everything_finetuned.py
+
+# Run Tutorial 05 (Boundary-Aware UNet++ Training & Deblending)
+python tutorials/05_train_unetplusplus.py
 ```
