@@ -104,6 +104,9 @@ def extract_cutouts_from_file(
     stride: Optional[int] = None,
     min_objects: int = 1,
     target_mode: str = "dense_3class",
+    boundary_width: int = 2,
+    soft_boundary: bool = False,
+    boundary_sigma: float = 1.2,
     max_samples: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -149,7 +152,14 @@ def extract_cutouts_from_file(
                 continue
 
             if target_mode == "dense_3class":
-                target_crop = generate_3class_boundary_mask(mask_crop).astype(np.int64)
+                target_crop = generate_3class_boundary_mask(
+                    mask_crop,
+                    boundary_width=boundary_width,
+                    soften=soft_boundary,
+                    sigma=boundary_sigma,
+                )
+                if not soft_boundary:
+                    target_crop = target_crop.astype(np.int64)
             else:
                 target_crop = mask_crop.astype(np.int64)
 
@@ -192,6 +202,9 @@ def write_shard_dataset(
     stride: Optional[int] = None,
     min_objects: int = 1,
     target_mode: str = "dense_3class",
+    boundary_width: int = 2,
+    soft_boundary: bool = False,
+    boundary_sigma: float = 1.2,
     max_samples_per_file: Optional[int] = None,
     max_samples_per_shard: int = 1000,
 ) -> int:
@@ -213,6 +226,9 @@ def write_shard_dataset(
                 stride=stride,
                 min_objects=min_objects,
                 target_mode=target_mode,
+                boundary_width=boundary_width,
+                soft_boundary=soft_boundary,
+                boundary_sigma=boundary_sigma,
                 max_samples=max_samples_per_file,
             )
 
@@ -247,6 +263,9 @@ def build_webdataset(
     max_samples_per_file: Optional[int] = None,
     max_samples_per_shard: int = 1000,
     target_mode: str = "dense_3class",
+    boundary_width: int = 2,
+    soft_boundary: bool = False,
+    boundary_sigma: float = 1.2,
     pattern: str = "*.fits",
     seed: int = 42,
 ) -> Dict[str, Any]:
@@ -291,6 +310,9 @@ def build_webdataset(
         stride=stride,
         min_objects=min_objects,
         target_mode=target_mode,
+        boundary_width=boundary_width,
+        soft_boundary=soft_boundary,
+        boundary_sigma=boundary_sigma,
         max_samples_per_file=max_samples_per_file,
         max_samples_per_shard=max_samples_per_shard,
     )
@@ -307,6 +329,9 @@ def build_webdataset(
             stride=stride,
             min_objects=min_objects,
             target_mode=target_mode,
+            boundary_width=boundary_width,
+            soft_boundary=soft_boundary,
+            boundary_sigma=boundary_sigma,
             max_samples_per_file=max_samples_per_file,
             max_samples_per_shard=max_samples_per_shard,
         )
@@ -393,6 +418,24 @@ def main():
         help="Target type: 'dense_3class' (0: sky, 1: core, 2: edge) or 'instance' (IDs).",
     )
     parser.add_argument(
+        "--boundary_width",
+        type=int,
+        default=2,
+        help="Pixel width of source boundary ring (default: 2).",
+    )
+    parser.add_argument(
+        "--soft_boundary",
+        action="store_true",
+        default=False,
+        help="Smooth boundary target with Gaussian filter into continuous probability simplex (3, H, W).",
+    )
+    parser.add_argument(
+        "--boundary_sigma",
+        type=float,
+        default=1.2,
+        help="Gaussian standard deviation for soft boundary smoothing (default: 1.2).",
+    )
+    parser.add_argument(
         "--pattern",
         type=str,
         default="*.fits",
@@ -414,6 +457,9 @@ def main():
         max_samples_per_file=args.samples_per_file,
         max_samples_per_shard=args.max_samples_per_shard,
         target_mode=args.target_mode,
+        boundary_width=args.boundary_width,
+        soft_boundary=args.soft_boundary,
+        boundary_sigma=args.boundary_sigma,
         pattern=args.pattern,
         seed=args.seed,
     )

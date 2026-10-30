@@ -47,13 +47,17 @@ class UNetPPTrainer:
         Number of channels per level.
     deep_supervision : bool, default False
         Whether to train with deep supervision across intermediate nodes.
-    learning_rate : float, default 3e-4
-        Initial AdamW learning rate.
-    weight_decay : float, default 1e-4
-        L2 regularization weight decay.
+    learning_rate : float, default 1e-4
+        Initial AdamW learning rate (lowered to 1e-4 to prevent validation bounce).
+    weight_decay : float, default 1e-2
+        AdamW weight decay regularizing UNet++ nested dense skip coefficients.
+    grad_clip_norm : float, default 1.0
+        Maximum norm for gradient clipping.
     class_weights : tuple or tensor, optional
         Class weights for loss balancing: [Background, Interior, Boundary].
-        Default: (1.0, 2.5, 4.0) to prioritize fine boundaries and source interiors.
+        Default: (0.5, 2.5, 8.0) down-weighting sky and prioritizing fine boundaries.
+    gpu_transform : nn.Module or bool, default True
+        GPU-accelerated transformations (leakySB, noise, augmentations).
     device : str or torch.device, optional
         Target device ('cuda', 'mps', 'cpu'). Auto-detected if None.
     """
@@ -65,8 +69,9 @@ class UNetPPTrainer:
         num_classes: int = 3,
         features: Tuple[int, ...] = (32, 64, 128, 256, 512),
         deep_supervision: bool = False,
-        learning_rate: float = 3e-4,
-        weight_decay: float = 1e-4,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-2,
+        grad_clip_norm: float = 1.0,
         class_weights: Optional[Union[Tuple[float, ...], List[float], torch.Tensor]] = None,
         gpu_transform: Optional[Union[nn.Module, bool]] = True,
         device: Optional[Union[str, torch.device]] = None,
@@ -90,9 +95,14 @@ class UNetPPTrainer:
             self.amp_dtype = (
                 torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             )
+            # Mixed precision safeguard: GradScaler for float16 (bfloat16 does not require scaling)
+            self.scaler = torch.amp.GradScaler(
+                "cuda", enabled=(self.use_amp and self.amp_dtype == torch.float16)
+            )
         else:
             self.use_amp = False
             self.amp_dtype = torch.float32
+            self.scaler = torch.amp.GradScaler("cuda", enabled=False)
 
         # Initialize model
         if model is not None:
@@ -109,10 +119,11 @@ class UNetPPTrainer:
         self.num_classes = num_classes
         self.deep_supervision = deep_supervision
         self.features = features
+        self.grad_clip_norm = grad_clip_norm
 
-        # Setup loss weights
+        # Setup loss weights (prioritize boundary over sky background)
         if class_weights is None:
-            weights_tensor = torch.tensor([1.0, 2.5, 4.0], dtype=torch.float32, device=self.device)
+            weights_tensor = torch.tensor([0.5, 2.5, 8.0], dtype=torch.float32, device=self.device)
         else:
             weights_tensor = torch.as_tensor(class_weights, dtype=torch.float32, device=self.device)
 
@@ -127,7 +138,7 @@ class UNetPPTrainer:
             lr=learning_rate,
             weight_decay=weight_decay,
         )
-        self.scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None
+        self.scheduler: Optional[Any] = None
         self.learning_rate = learning_rate
 
         # GPU-Accelerated Astronomical Transforms (leakySB + noise/spatial augmentations)
@@ -154,7 +165,7 @@ class UNetPPTrainer:
         return res
 
     def train_epoch(self, dataloader: DataLoader) -> float:
-        """Run one training epoch."""
+        """Run one training epoch with mixed precision, gradient clipping, and NaN safeguards."""
         self.model.train()
         if self.gpu_transform is not None:
             self.gpu_transform.train()
@@ -191,9 +202,31 @@ class UNetPPTrainer:
                 else:
                     loss = self.criterion(outputs, targets)
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            # Mixed precision & numerical stability safeguard: check for NaNs/Infs
+            if not torch.isfinite(loss):
+                logger.warning(
+                    f"[sam2roman] Non-finite loss detected ({loss.item()}) at step {steps}. Skipping backward step."
+                )
+                self.optimizer.zero_grad()
+                continue
+
+            # Backward pass with GradScaler for float16 mixed precision
+            if self.scaler.is_enabled():
+                self.scaler.scale(loss).backward()
+                if self.grad_clip_norm is not None and self.grad_clip_norm > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_norm=self.grad_clip_norm
+                    )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                if self.grad_clip_norm is not None and self.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_norm=self.grad_clip_norm
+                    )
+                self.optimizer.step()
 
             total_loss += loss.item()
             steps += 1
@@ -241,16 +274,22 @@ class UNetPPTrainer:
                 total_loss += loss.item()
                 preds = torch.argmax(logits, dim=1)  # (B, H, W)
 
+                # Support both discrete (B, H, W) and soft continuous (B, num_classes, H, W) targets
+                if targets.ndim == 4:
+                    target_classes = torch.argmax(targets, dim=1)
+                else:
+                    target_classes = targets
+
                 # Interior IoU (Class 1)
                 p_int = (preds == 1)
-                t_int = (targets == 1)
+                t_int = (target_classes == 1)
                 int_inter = torch.sum(p_int & t_int).item()
                 int_union = torch.sum(p_int | t_int).item()
                 iou_int = (int_inter + 1e-6) / (int_union + 1e-6)
 
                 # Boundary IoU (Class 2)
                 p_bound = (preds == 2)
-                t_bound = (targets == 2)
+                t_bound = (target_classes == 2)
                 bound_inter = torch.sum(p_bound & t_bound).item()
                 bound_union = torch.sum(p_bound | t_bound).item()
                 iou_bound = (bound_inter + 1e-6) / (bound_union + 1e-6)
@@ -277,6 +316,8 @@ class UNetPPTrainer:
         epochs: int = 10,
         batch_size: int = 8,
         val_dataset: Optional[Union[AstronomicalDataset, DataLoader, str, Path]] = None,
+        scheduler_type: str = "cosine",
+        warmup_epochs: int = 2,
         output_dir: Optional[Union[str, Path]] = None,
         verbose: bool = True,
         num_workers: int = 0,
@@ -297,6 +338,10 @@ class UNetPPTrainer:
             Mini-batch size (can be set to 16–64 on Grace Hopper H100 or A100).
         val_dataset : AstronomicalDataset, DataLoader, str, or Path, optional
             Optional validation dataset, loader, or WebDataset shard path.
+        scheduler_type : str, default 'cosine'
+            Learning rate scheduler: 'cosine' (with linear warmup), 'plateau' (ReduceLROnPlateau), or 'none'.
+        warmup_epochs : int, default 2
+            Number of warmup epochs for cosine schedule to prevent validation bounce.
         output_dir : str or Path, optional
             Directory to save checkpoints.
         verbose : bool, default True
@@ -311,12 +356,41 @@ class UNetPPTrainer:
         if pin_memory is None:
             pin_memory = (self.device.type == "cuda")
 
-        # Setup Cosine Annealing learning rate schedule
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=epochs,
-            eta_min=self.learning_rate * 0.05,
-        )
+        # Setup learning rate schedule
+        if scheduler_type == "cosine":
+            if warmup_epochs > 0 and epochs > warmup_epochs:
+                sched_warmup = torch.optim.lr_scheduler.LinearLR(
+                    self.optimizer,
+                    start_factor=0.2,
+                    end_factor=1.0,
+                    total_iters=warmup_epochs,
+                )
+                sched_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=epochs - warmup_epochs,
+                    eta_min=self.learning_rate * 0.05,
+                )
+                self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    self.optimizer,
+                    schedulers=[sched_warmup, sched_cosine],
+                    milestones=[warmup_epochs],
+                )
+            else:
+                self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=epochs,
+                    eta_min=self.learning_rate * 0.05,
+                )
+        elif scheduler_type == "plateau":
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=0.5,
+                patience=2,
+                min_lr=self.learning_rate * 0.01,
+            )
+        else:
+            self.scheduler = None
 
         # Build or wrap train DataLoader
         if isinstance(dataset, DataLoader):
@@ -368,6 +442,7 @@ class UNetPPTrainer:
             "val_macro_iou": [],
             "val_interior_iou": [],
             "val_boundary_iou": [],
+            "learning_rate": [],
         }
 
         best_val_loss = float("inf")
@@ -388,21 +463,27 @@ class UNetPPTrainer:
             if val_dataset is not None:
                 print(f"  -> Validation cutouts:  {n_val_str}")
             print(f"  -> Batch size:          {batch_size}")
+            print(f"  -> Initial LR:          {self.learning_rate:.2e} (AdamW weight_decay={self.optimizer.param_groups[0]['weight_decay']:.2e})")
+            print(f"  -> LR Schedule:         {scheduler_type} (warmup_epochs={warmup_epochs})")
+            print(f"  -> Grad Clipping:       max_norm={self.grad_clip_norm}")
             print(f"  -> DataLoader:          shuffle={shuffle}, num_workers={num_workers}, pin_memory={pin_memory}")
             if self.device.type == "cuda":
-                print(f"  -> CUDA Acceleration:   TF32=True, AMP ({self.amp_dtype})")
+                print(f"  -> CUDA Acceleration:   TF32=True, AMP ({self.amp_dtype}), GradScaler={self.scaler.is_enabled()}")
             elif self.device.type == "mps":
                 print(f"  -> Apple Silicon MPS:   Metal Performance Shaders active (FP32)")
             print("-" * 75)
 
         for epoch in range(1, epochs + 1):
             t0 = time.time()
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            history["learning_rate"].append(current_lr)
+
             train_loss = self.train_epoch(train_loader)
             history["train_loss"].append(train_loss)
-            self.scheduler.step()
             elapsed = time.time() - t0
 
             val_str = ""
+            val_loss = None
             if val_loader is not None:
                 val_loss, macro_iou, int_iou, bound_iou = self.evaluate(val_loader)
                 history["val_loss"].append(val_loss)
@@ -420,8 +501,19 @@ class UNetPPTrainer:
                     best_path = Path(output_dir) / "unetpp_best.pt"
                     self.save_checkpoint(best_path)
 
+            # Step learning rate scheduler
+            if self.scheduler is not None:
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    metric = val_loss if val_loss is not None else train_loss
+                    self.scheduler.step(metric)
+                else:
+                    self.scheduler.step()
+
             if verbose:
-                print(f"Epoch [{epoch:02d}/{epochs:02d}] - Train Loss: {train_loss:.4f}{val_str} ({elapsed:.1f}s)")
+                print(
+                    f"Epoch [{epoch:02d}/{epochs:02d}] - LR: {current_lr:.2e} - "
+                    f"Train Loss: {train_loss:.4f}{val_str} ({elapsed:.1f}s)"
+                )
 
             if output_dir:
                 save_path = Path(output_dir) / f"unetpp_epoch_{epoch}.pt"

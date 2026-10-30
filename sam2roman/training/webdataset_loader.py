@@ -55,9 +55,14 @@ def collate_webdataset_batch(batch: List[Sequence[Any]]) -> Dict[str, Any]:
             if t_raw.ndim == 2:
                 t_raw = t_raw.unsqueeze(0)
 
-        t_tgt = torch.from_numpy(tgt_arr).long()
-        if t_tgt.ndim == 3 and t_tgt.shape[0] == 1:
-            t_tgt = t_tgt.squeeze(0)
+        # Support continuous soft targets (e.g. float32 probability maps or distance fields)
+        # as well as discrete integer class masks
+        if np.issubdtype(tgt_arr.dtype, np.floating) or (tgt_arr.ndim == 3 and tgt_arr.shape[0] > 1):
+            t_tgt = torch.from_numpy(tgt_arr).float()
+        else:
+            t_tgt = torch.from_numpy(tgt_arr).long()
+            if t_tgt.ndim == 3 and t_tgt.shape[0] == 1:
+                t_tgt = t_tgt.squeeze(0)
 
         raw_list.append(t_raw)
         target_list.append(t_tgt)

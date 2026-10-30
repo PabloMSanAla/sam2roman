@@ -1,9 +1,11 @@
 """
 Segmentation loss functions for astronomical source extraction and fine-tuning.
+Includes class-imbalance robust losses: Balanced Boundary Composite Loss, Focal Loss, and Dice Loss.
 """
 
 from __future__ import annotations
 
+from typing import Optional, Sequence, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,14 +21,6 @@ class DiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, pred_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        pred_logits : torch.Tensor
-            Unnormalized logits from mask decoder, shape (N, ...).
-        targets : torch.Tensor
-            Binary ground truth masks (0 or 1), shape (N, ...).
-        """
         probs = torch.sigmoid(pred_logits)
         probs_flat = probs.contiguous().view(-1)
         targets_flat = targets.contiguous().view(-1).float()
@@ -74,35 +68,59 @@ class CombinedSegmentationLoss(nn.Module):
         return self.bce_weight * bce + self.dice_weight * dice
 
 
-class MultiClassCombinedLoss(nn.Module):
+class BalancedBoundaryCompositeLoss(nn.Module):
     """
-    Combined Cross-Entropy and Multi-Class Dice Loss for boundary-aware UNet++ training.
+    Balanced Composite Loss for astronomical source and boundary segmentation.
+    Designed specifically to overcome severe class imbalance (~97% sky background, ~0.5% edge)
+    and optimization instability:
 
-    Parameters
-    ----------
-    class_weights : Optional[torch.Tensor]
-        Optional class weighting for CrossEntropy (e.g. [1.0, 2.5, 4.0] for bg, interior, edge).
-    ce_weight : float, default 1.0
-        Weight factor for CrossEntropy loss.
-    dice_weight : float, default 1.0
-        Weight factor for Dice loss.
-    smooth : float, default 1.0
-        Laplace smoothing term for Dice calculation.
+    1. Multi-Class Focal Loss (gamma=2.0) with edge prioritization (alpha=[0.5, 2.5, 8.0]):
+       Exponentially suppresses confident background gradients by up to 10,000x while maintaining
+       strong gradients on rare boundary and core pixels.
+    2. Class-Weighted Soft Dice Loss:
+       Allocates class weights (default [0.1, 0.4, 0.5]) so that boundary delineation receives 50%
+       of the spatial overlap gradient, preventing background from dominating.
+    3. Dual Support for Hard & Soft Targets:
+       Seamlessly accepts discrete class labels (B, H, W) in {0, 1, 2} or continuous soft-boundary
+       probability fields (B, 3, H, W).
+    4. Numerical Stability Safeguards:
+       Logit clamping [-30.0, 30.0], Laplace epsilon smoothing, and torch.nan_to_num guard.
     """
 
     def __init__(
         self,
-        class_weights: Optional[torch.Tensor] = None,
-        ce_weight: float = 1.0,
+        class_weights: Optional[Union[Sequence[float], torch.Tensor]] = None,
+        dice_class_weights: Optional[Union[Sequence[float], torch.Tensor]] = None,
+        gamma: float = 2.0,
+        focal_weight: float = 1.0,
         dice_weight: float = 1.0,
         smooth: float = 1.0,
+        logit_clamp: float = 30.0,
     ):
         super().__init__()
-        self.ce_weight = ce_weight
-        self.dice_weight = dice_weight
-        self.smooth = smooth
-        self.register_buffer("class_weights", class_weights)
-        self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
+        if class_weights is None:
+            # Heavily prioritize edge (class 2: 8.0) and interior (class 1: 2.5) over sky (class 0: 0.5)
+            cw = [0.5, 2.5, 8.0]
+        elif isinstance(class_weights, (list, tuple)):
+            cw = list(class_weights)
+        else:
+            cw = class_weights.detach().cpu().tolist()
+
+        if dice_class_weights is None:
+            # 50% dice weight on edge, 40% on core, 10% on background
+            dw = [0.1, 0.4, 0.5]
+        elif isinstance(dice_class_weights, (list, tuple)):
+            dw = list(dice_class_weights)
+        else:
+            dw = dice_class_weights.detach().cpu().tolist()
+
+        self.register_buffer("class_weights", torch.tensor(cw, dtype=torch.float32))
+        self.register_buffer("dice_class_weights", torch.tensor(dw, dtype=torch.float32))
+        self.gamma = float(gamma)
+        self.focal_weight = float(focal_weight)
+        self.dice_weight = float(dice_weight)
+        self.smooth = float(smooth)
+        self.logit_clamp = float(logit_clamp)
 
     def forward(
         self,
@@ -110,34 +128,107 @@ class MultiClassCombinedLoss(nn.Module):
         targets: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute combined loss.
+        Compute balanced composite loss.
 
         Parameters
         ----------
         pred_logits : torch.Tensor
             Logits of shape (B, num_classes, H, W).
         targets : torch.Tensor
-            Ground truth class labels of shape (B, H, W) with dtype int64.
+            Ground truth targets: either discrete (B, H, W) int64 or continuous soft targets (B, num_classes, H, W).
         """
-        # CrossEntropy
-        ce = self.ce_loss(pred_logits, targets)
+        # Mixed precision safeguard: clamp logits to prevent exp() overflow
+        clamped_logits = torch.clamp(pred_logits, -self.logit_clamp, self.logit_clamp)
+        log_probs = F.log_softmax(clamped_logits, dim=1)
+        probs = torch.exp(log_probs)
+        num_classes = clamped_logits.shape[1]
 
-        # Multi-class Dice
-        probs = F.softmax(pred_logits, dim=1)
-        num_classes = pred_logits.shape[1]
+        # Convert discrete targets (B, H, W) to one-hot (B, num_classes, H, W)
+        if targets.ndim == 3:
+            targets_one_hot = (
+                F.one_hot(targets.clamp(0, num_classes - 1), num_classes=num_classes)
+                .permute(0, 3, 1, 2)
+                .float()
+            )
+        elif targets.ndim == 4:
+            targets_one_hot = targets.float()
+        else:
+            raise ValueError(f"Unsupported target shape: {targets.shape}")
 
-        # One-hot encode targets to (B, num_classes, H, W)
-        targets_one_hot = (
-            F.one_hot(targets, num_classes=num_classes)
-            .permute(0, 3, 1, 2)
-            .float()
-        )
+        # Ensure class weights match device and num_classes
+        if self.class_weights.numel() != num_classes:
+            cw = torch.ones(num_classes, device=clamped_logits.device, dtype=clamped_logits.dtype)
+        else:
+            cw = self.class_weights.to(clamped_logits.device, dtype=clamped_logits.dtype)
 
+        if self.dice_class_weights.numel() != num_classes:
+            dw = torch.ones(num_classes, device=clamped_logits.device, dtype=clamped_logits.dtype)
+        else:
+            dw = self.dice_class_weights.to(clamped_logits.device, dtype=clamped_logits.dtype)
+
+        # 1. Multi-Class Edge-Prioritized Focal Loss
+        # Down-weight confident pixels: (1 - p_t)^gamma
+        focal_modulator = torch.pow(1.0 - probs, self.gamma)
+        alpha_t = cw.view(1, num_classes, 1, 1)
+        pixel_focal = - (alpha_t * focal_modulator * targets_one_hot * log_probs)
+        focal_loss = pixel_focal.sum(dim=1).mean()
+
+        # 2. Class-Weighted Soft Dice Loss
         dims = (0, 2, 3)
         intersection = torch.sum(probs * targets_one_hot, dim=dims)
         cardinality = torch.sum(probs + targets_one_hot, dim=dims)
         dice_per_class = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
-        dice_loss = 1.0 - torch.mean(dice_per_class)
+        weighted_dice = (dw * dice_per_class).sum() / (dw.sum() + 1e-7)
+        dice_loss = 1.0 - weighted_dice
 
-        return self.ce_weight * ce + self.dice_weight * dice_loss
+        # 3. Composite combination with NaN guard
+        total_loss = self.focal_weight * focal_loss + self.dice_weight * dice_loss
+        return torch.nan_to_num(total_loss, nan=0.0, posinf=50.0, neginf=0.0)
 
+
+class MultiClassCombinedLoss(nn.Module):
+    """
+    Combined Loss for boundary-aware UNet++ training.
+    Defaults to BalancedBoundaryCompositeLoss with edge prioritization and soft target support.
+
+    Parameters
+    ----------
+    class_weights : Optional[torch.Tensor]
+        Class weighting for Focal/CE loss (e.g. [0.5, 2.5, 8.0] for bg, interior, edge).
+    ce_weight : float, default 1.0
+        Weight factor for Focal/CE loss.
+    dice_weight : float, default 1.0
+        Weight factor for Dice loss.
+    smooth : float, default 1.0
+        Laplace smoothing term for Dice calculation.
+    gamma : float, default 2.0
+        Focal modulating exponent.
+    use_focal : bool, default True
+        Whether to use Focal loss modulating factor to downweight easy background.
+    """
+
+    def __init__(
+        self,
+        class_weights: Optional[Union[Sequence[float], torch.Tensor]] = None,
+        ce_weight: float = 1.0,
+        dice_weight: float = 1.0,
+        smooth: float = 1.0,
+        gamma: float = 2.0,
+        use_focal: bool = True,
+    ):
+        super().__init__()
+        self.balanced_loss = BalancedBoundaryCompositeLoss(
+            class_weights=class_weights if class_weights is not None else [0.5, 2.5, 8.0],
+            dice_class_weights=[0.1, 0.4, 0.5],
+            gamma=gamma if use_focal else 0.0,
+            focal_weight=ce_weight,
+            dice_weight=dice_weight,
+            smooth=smooth,
+        )
+
+    def forward(
+        self,
+        pred_logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.balanced_loss(pred_logits, targets)

@@ -98,8 +98,10 @@ def main():
         in_channels=3,
         num_classes=3,               # 0: Sky, 1: Interior, 2: Boundary/Edge
         features=(32, 64, 128, 256, 512),
-        learning_rate=3e-4,
-        class_weights=(1.0, 2.5, 4.0),  # Weights emphasizing interior and edge
+        learning_rate=1e-4,          # Lower initial LR prevents stepping over local minima
+        weight_decay=1e-2,           # Regularizes nested skip dense coefficients
+        grad_clip_norm=1.0,          # Prevents gradient explosions
+        class_weights=(0.5, 2.5, 8.0),  # Down-weights sky (97%) and emphasizes boundaries
         device=device,
     )
 

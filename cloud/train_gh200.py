@@ -100,8 +100,34 @@ def main():
     parser.add_argument(
         "--lr",
         type=float,
-        default=3e-4,
-        help="Initial learning rate for AdamW.",
+        default=1e-4,
+        help="Initial learning rate for AdamW (lowered to 1e-4 for optimization stability).",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=1e-2,
+        help="AdamW weight decay regularizing UNet++ dense nested skip connections (default: 1e-2).",
+    )
+    parser.add_argument(
+        "--grad_clip_norm",
+        type=float,
+        default=1.0,
+        help="Maximum norm for gradient clipping (default: 1.0).",
+    )
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="cosine",
+        choices=["cosine", "plateau", "none"],
+        dest="scheduler_type",
+        help="Learning rate scheduler (default: 'cosine' with warmup).",
+    )
+    parser.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=2,
+        help="Number of linear warmup epochs before cosine decay (default: 2).",
     )
     parser.add_argument(
         "--num_workers",
@@ -174,13 +200,15 @@ def main():
         },
     ).to(device)
 
-    # Initialize UNet++ Trainer with GPU transforms
+    # Initialize UNet++ Trainer with GPU transforms and edge-prioritized balanced composite loss
     trainer = UNetPPTrainer(
         in_channels=3,
         num_classes=3,
         features=(32, 64, 128, 256, 512),
         learning_rate=args.lr,
-        class_weights=(1.0, 2.5, 4.0),
+        weight_decay=args.weight_decay,
+        grad_clip_norm=args.grad_clip_norm,
+        class_weights=(0.5, 2.5, 8.0),
         gpu_transform=gpu_transform,
         device=device,
     )
@@ -193,6 +221,8 @@ def main():
         val_dataset=val_shards,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        scheduler_type=args.scheduler_type,
+        warmup_epochs=args.warmup_epochs,
         num_workers=args.num_workers,
         output_dir=output_dir,
         verbose=True,

@@ -90,6 +90,9 @@ class AstronomicalDataset(Dataset):
         pixel_scale: float = 0.11,
         mmin: float = 13.0,
         mmax: float = 32.0,
+        soft_boundary: bool = False,
+        boundary_width: int = 2,
+        boundary_sigma: float = 1.2,
         transform: Optional[Any] = None,
     ):
         if len(images) != len(masks):
@@ -111,6 +114,9 @@ class AstronomicalDataset(Dataset):
         self.pixel_scale = pixel_scale
         self.mmin = mmin
         self.mmax = mmax
+        self.soft_boundary = soft_boundary
+        self.boundary_width = boundary_width
+        self.boundary_sigma = boundary_sigma
         self.transform = transform
 
         self.indexed_objects: Optional[List[Dict[str, Any]]] = None
@@ -166,6 +172,9 @@ class AstronomicalDataset(Dataset):
         pixel_scale: float = 0.11,
         mmin: float = 13.0,
         mmax: float = 32.0,
+        soft_boundary: bool = False,
+        boundary_width: int = 2,
+        boundary_sigma: float = 1.2,
         max_samples: Optional[int] = None,
     ) -> "AstronomicalDataset":
         """
@@ -253,6 +262,9 @@ class AstronomicalDataset(Dataset):
             pixel_scale=pixel_scale,
             mmin=mmin,
             mmax=mmax,
+            soft_boundary=soft_boundary,
+            boundary_width=boundary_width,
+            boundary_sigma=boundary_sigma,
         )
 
     @classmethod
@@ -274,6 +286,9 @@ class AstronomicalDataset(Dataset):
         pixel_scale: float = 0.11,
         mmin: float = 13.0,
         mmax: float = 32.0,
+        soft_boundary: bool = False,
+        boundary_width: int = 2,
+        boundary_sigma: float = 1.2,
     ) -> "AstronomicalDataset":
         """Create a multi-sample dataset from ONE single large FITS image and segmap by slicing into tiles."""
         if isinstance(fits_image, (str, Path)):
@@ -324,6 +339,9 @@ class AstronomicalDataset(Dataset):
             pixel_scale=pixel_scale,
             mmin=mmin,
             mmax=mmax,
+            soft_boundary=soft_boundary,
+            boundary_width=boundary_width,
+            boundary_sigma=boundary_sigma,
         )
 
     def _load_image_array(self, idx: int) -> np.ndarray:
@@ -407,8 +425,16 @@ class AstronomicalDataset(Dataset):
             image_tensor = torch.from_numpy(rgb_3ch).permute(2, 0, 1).float() / 255.0
             pil_image = Image.fromarray(rgb_3ch, mode="RGB")
 
-            target_3class = generate_3class_boundary_mask(crop_raw_mask)
-            target_tensor = torch.from_numpy(target_3class).long()  # (H, W)
+            target_3class = generate_3class_boundary_mask(
+                crop_raw_mask,
+                boundary_width=self.boundary_width,
+                soften=self.soft_boundary,
+                sigma=self.boundary_sigma,
+            )
+            if self.soft_boundary:
+                target_tensor = torch.from_numpy(target_3class).float()  # (3, H, W)
+            else:
+                target_tensor = torch.from_numpy(target_3class).long()   # (H, W)
 
             return {
                 "image": image_tensor,

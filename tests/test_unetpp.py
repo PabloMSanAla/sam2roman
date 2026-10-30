@@ -141,3 +141,71 @@ def test_unetpp_training_on_mps_or_cpu(tmp_path):
     # Verify photometry works seamlessly on UNet++ segmentation output
     phot = res.compute_photometry(imgs[0], verbose=False)
     assert isinstance(phot, list)
+
+
+def test_soft_boundary_and_sdf_generation():
+    from sam2roman.training.boundary import (
+        generate_soft_boundary_target,
+        generate_distance_transform_target,
+    )
+
+    segmap = np.zeros((64, 64), dtype=np.int32)
+    segmap[20:44, 20:44] = 1
+
+    # Option A: Soft continuous boundary probability simplex
+    soft_target = generate_soft_boundary_target(segmap, boundary_width=2, sigma=1.2)
+    assert soft_target.shape == (3, 64, 64)
+    assert soft_target.dtype == np.float32
+    # Verify probability simplex sums to 1.0 everywhere
+    simplex_sums = np.sum(soft_target, axis=0)
+    np.testing.assert_allclose(simplex_sums, 1.0, atol=1e-5)
+    # Check that boundary channel (channel 2) contains smooth values > 0
+    assert np.max(soft_target[2]) > 0.0
+    assert np.min(soft_target[2]) >= 0.0
+
+    # Option B: Signed Distance Field (SDF)
+    sdf = generate_distance_transform_target(segmap, max_distance=10.0, truncate=True)
+    assert sdf.shape == (64, 64)
+    assert np.all(sdf >= -1.0) and np.all(sdf <= 1.0)
+    # Inside source should be positive, background negative
+    assert sdf[32, 32] > 0.0
+    assert sdf[5, 5] < 0.0
+
+
+def test_trainer_schedulers_and_soft_targets(tmp_path):
+    """Verify trainer with soft targets, gradient clipping, and cosine warmup scheduler."""
+    imgs = [np.random.normal(12.0, 1.5, (64, 64)).astype(np.float32) for _ in range(2)]
+    masks = [np.zeros((64, 64), dtype=np.int32) for _ in range(2)]
+    masks[0][15:35, 15:35] = 1
+    masks[1][20:40, 20:40] = 1
+
+    dataset = AstronomicalDataset(
+        images=imgs,
+        masks=masks,
+        target_mode="dense_3class",
+        soft_boundary=True,
+    )
+    sample = dataset[0]
+    assert sample["target"].shape == (3, 64, 64)
+    assert sample["target"].dtype == torch.float32
+
+    trainer = UNetPPTrainer(
+        features=(8, 16, 32, 64, 128),
+        learning_rate=1e-4,
+        weight_decay=1e-2,
+        grad_clip_norm=1.0,
+        device="cpu",
+    )
+
+    history = trainer.train(
+        dataset=dataset,
+        epochs=3,
+        batch_size=2,
+        scheduler_type="cosine",
+        warmup_epochs=1,
+        verbose=False,
+    )
+    assert len(history["train_loss"]) == 3
+    assert len(history["learning_rate"]) == 3
+    # Check that warmup increased LR from start_factor
+    assert history["learning_rate"][1] > history["learning_rate"][0]
