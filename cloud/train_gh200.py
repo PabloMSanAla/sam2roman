@@ -159,6 +159,12 @@ def main():
         default=1.2,
         help="Gaussian sigma for edge smoothing (default: 1.2).",
     )
+    parser.add_argument(
+        "--boundary_tolerance",
+        type=int,
+        default=1,
+        help="Pixel distance tolerance for relaxed boundary IoU validation (default: 1 px).",
+    )
 
     args = parser.parse_args()
 
@@ -223,6 +229,7 @@ def main():
         weight_decay=args.weight_decay,
         grad_clip_norm=args.grad_clip_norm,
         class_weights=(0.5, 2.5, 8.0),
+        boundary_tolerance=args.boundary_tolerance,
         gpu_transform=gpu_transform,
         device=device,
     )
@@ -262,7 +269,11 @@ def main():
     if history["val_macro_iou"]:
         ax2.plot(ep_range, history["val_macro_iou"], "^-", label="Macro IoU", color="purple")
         ax2.plot(ep_range, history["val_interior_iou"], "o--", label="Interior IoU", color="forestgreen")
-        ax2.plot(ep_range, history["val_boundary_iou"], "d--", label="Edge IoU", color="orange")
+        ax2.plot(ep_range, history["val_boundary_iou"], "d-", label=f"Edge IoU (tol={args.boundary_tolerance}px)", color="orange")
+        if "val_strict_boundary_iou" in history and history["val_strict_boundary_iou"]:
+            ax2.plot(ep_range, history["val_strict_boundary_iou"], ":", label="Strict Edge IoU (0px)", color="gray", alpha=0.7)
+        if "val_soft_boundary_iou" in history and history["val_soft_boundary_iou"]:
+            ax2.plot(ep_range, history["val_soft_boundary_iou"], "--", label="Soft Edge IoU", color="darkcyan", alpha=0.7)
         ax2.set_xlabel("Epoch")
         ax2.set_ylabel("IoU")
         ax2.set_title("Validation Segmentation Metrics")

@@ -45,6 +45,7 @@ htmlcov/
 # Hugging Face and model weights
 .cache/
 checkpoints/
+experiments/
 *.pt
 *.pth
 *.bin

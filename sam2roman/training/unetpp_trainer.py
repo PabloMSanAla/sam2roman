@@ -22,6 +22,7 @@ from sam2roman.training.losses import MultiClassCombinedLoss
 from sam2roman.training.dataset import AstronomicalDataset
 from sam2roman.training.gpu_transforms import GPUAstroTransform
 from sam2roman.training.webdataset_loader import create_webdataset_loader
+from sam2roman.training.metrics import evaluate_batch_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,8 @@ class UNetPPTrainer:
     class_weights : tuple or tensor, optional
         Class weights for loss balancing: [Background, Interior, Boundary].
         Default: (0.5, 2.5, 8.0) down-weighting sky and prioritizing fine boundaries.
+    boundary_tolerance : int, default 1
+        Pixel distance tolerance for relaxed boundary IoU validation metric (default: 1 px).
     gpu_transform : nn.Module or bool, default True
         GPU-accelerated transformations (leakySB, noise, augmentations).
     device : str or torch.device, optional
@@ -102,6 +105,7 @@ class UNetPPTrainer:
         weight_decay: float = 1e-2,
         grad_clip_norm: float = 1.0,
         class_weights: Optional[Union[Tuple[float, ...], List[float], torch.Tensor]] = None,
+        boundary_tolerance: int = 1,
         gpu_transform: Optional[Union[nn.Module, bool]] = True,
         device: Optional[Union[str, torch.device]] = None,
     ):
@@ -149,6 +153,8 @@ class UNetPPTrainer:
         self.deep_supervision = deep_supervision
         self.features = features
         self.grad_clip_norm = grad_clip_norm
+        self.boundary_tolerance = boundary_tolerance
+        self.last_eval_metrics: Dict[str, float] = {}
 
         # Setup loss weights (prioritize boundary over sky background)
         if class_weights is None:
@@ -262,10 +268,25 @@ class UNetPPTrainer:
 
         return total_loss / max(1, steps)
 
-    def evaluate(self, dataloader: DataLoader) -> Tuple[float, float, float, float]:
+    def evaluate(
+        self,
+        dataloader: DataLoader,
+        boundary_tolerance: Optional[int] = None,
+    ) -> Tuple[float, float, float, float]:
         """
-        Evaluate on validation dataset.
-        Returns: (val_loss, macro_iou, interior_iou, boundary_iou)
+        Evaluate on validation dataset using distance-tolerant and soft boundary metrics.
+
+        Parameters
+        ----------
+        dataloader : DataLoader
+            Validation dataloader.
+        boundary_tolerance : int, optional
+            Pixel slack tolerance (defaults to self.boundary_tolerance, e.g. 1 or 2 px).
+
+        Returns
+        -------
+        Tuple[float, float, float, float]:
+            (val_loss, macro_iou, interior_iou, relaxed_boundary_iou)
         """
         self.model.eval()
         if self.gpu_transform is not None:
@@ -273,8 +294,12 @@ class UNetPPTrainer:
         total_loss = 0.0
         steps = 0
 
+        tol = self.boundary_tolerance if boundary_tolerance is None else boundary_tolerance
+
         total_interior_iou = 0.0
-        total_boundary_iou = 0.0
+        total_relaxed_boundary_iou = 0.0
+        total_strict_boundary_iou = 0.0
+        total_soft_boundary_iou = 0.0
         total_macro_iou = 0.0
 
         with torch.no_grad():
@@ -301,42 +326,30 @@ class UNetPPTrainer:
                     loss = self.criterion(logits, targets)
 
                 total_loss += loss.item()
-                preds = torch.argmax(logits, dim=1)  # (B, H, W)
 
-                # Support both discrete (B, H, W) and soft continuous (B, num_classes, H, W) targets
-                if targets.ndim == 4:
-                    target_classes = torch.argmax(targets, dim=1)
-                else:
-                    target_classes = targets
-
-                # Interior IoU (Class 1)
-                p_int = (preds == 1)
-                t_int = (target_classes == 1)
-                int_inter = torch.sum(p_int & t_int).item()
-                int_union = torch.sum(p_int | t_int).item()
-                iou_int = (int_inter + 1e-6) / (int_union + 1e-6)
-
-                # Boundary IoU (Class 2)
-                p_bound = (preds == 2)
-                t_bound = (target_classes == 2)
-                bound_inter = torch.sum(p_bound & t_bound).item()
-                bound_union = torch.sum(p_bound | t_bound).item()
-                iou_bound = (bound_inter + 1e-6) / (bound_union + 1e-6)
-
-                # Macro IoU (mean of interior and boundary)
-                macro_iou = 0.5 * (iou_int + iou_bound)
-
-                total_interior_iou += iou_int
-                total_boundary_iou += iou_bound
-                total_macro_iou += macro_iou
+                metrics = evaluate_batch_metrics(logits, targets, boundary_tolerance=tol)
+                total_interior_iou += metrics["interior_iou"]
+                total_relaxed_boundary_iou += metrics["relaxed_boundary_iou"]
+                total_strict_boundary_iou += metrics["strict_boundary_iou"]
+                total_soft_boundary_iou += metrics["soft_boundary_iou"]
+                total_macro_iou += metrics["macro_iou"]
                 steps += 1
 
         n = max(1, steps)
+        self.last_eval_metrics = {
+            "val_loss": total_loss / n,
+            "macro_iou": total_macro_iou / n,
+            "interior_iou": total_interior_iou / n,
+            "relaxed_boundary_iou": total_relaxed_boundary_iou / n,
+            "strict_boundary_iou": total_strict_boundary_iou / n,
+            "soft_boundary_iou": total_soft_boundary_iou / n,
+        }
+
         return (
             total_loss / n,
             total_macro_iou / n,
             total_interior_iou / n,
-            total_boundary_iou / n,
+            total_relaxed_boundary_iou / n,
         )
 
     def train(
@@ -471,6 +484,8 @@ class UNetPPTrainer:
             "val_macro_iou": [],
             "val_interior_iou": [],
             "val_boundary_iou": [],
+            "val_strict_boundary_iou": [],
+            "val_soft_boundary_iou": [],
             "learning_rate": [],
         }
 
@@ -491,6 +506,7 @@ class UNetPPTrainer:
             print(f"  -> Initial LR:          {self.learning_rate:.2e} (AdamW weight_decay={self.optimizer.param_groups[0]['weight_decay']:.2e})")
             print(f"  -> LR Schedule:         {scheduler_type} (warmup_epochs={warmup_epochs})")
             print(f"  -> Grad Clipping:       max_norm={self.grad_clip_norm}")
+            print(f"  -> Boundary Metric:     Distance-Tolerant IoU (tolerance={self.boundary_tolerance}px) + Soft Continuous IoU")
             print(f"  -> DataLoader:          shuffle={shuffle}, num_workers={num_workers}, pin_memory={pin_memory}")
             if self.device.type == "cuda":
                 print(f"  -> CUDA Acceleration:   TF32=True, AMP ({self.amp_dtype}), GradScaler={self.scaler.is_enabled()}")
@@ -511,14 +527,18 @@ class UNetPPTrainer:
             val_loss = None
             if val_loader is not None:
                 val_loss, macro_iou, int_iou, bound_iou = self.evaluate(val_loader)
+                m = self.last_eval_metrics
                 history["val_loss"].append(val_loss)
                 history["val_macro_iou"].append(macro_iou)
                 history["val_interior_iou"].append(int_iou)
                 history["val_boundary_iou"].append(bound_iou)
+                history["val_strict_boundary_iou"].append(m["strict_boundary_iou"])
+                history["val_soft_boundary_iou"].append(m["soft_boundary_iou"])
 
                 val_str = (
                     f" | Val Loss: {val_loss:.4f} | Macro IoU: {macro_iou:.4f} "
-                    f"(Interior: {int_iou:.3f}, Edge: {bound_iou:.3f})"
+                    f"(Interior: {int_iou:.3f}, Edge [tol={self.boundary_tolerance}px]: {bound_iou:.3f}, "
+                    f"Strict: {m['strict_boundary_iou']:.3f}, Soft: {m['soft_boundary_iou']:.3f})"
                 )
 
                 if output_dir and val_loss < best_val_loss:
