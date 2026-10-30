@@ -205,3 +205,37 @@ def test_unetpp_webdataset_end_to_end(synthetic_fits_dir, tmp_path):
 
     assert len(history["train_loss"]) == 2
     assert history["train_loss"][0] > 0
+
+
+def test_webdataset_viewer_export(synthetic_fits_dir, tmp_path):
+    """Verify WebDatasetViewer loads shards and exports preview panels."""
+    from sam2roman.tools.view_webdataset import WebDatasetViewer
+
+    images_dir, masks_dir = synthetic_fits_dir
+    shards_dir = tmp_path / "view_shards"
+    preview_dir = tmp_path / "previews"
+
+    build_webdataset(
+        images_dir=images_dir,
+        masks_dir=masks_dir,
+        output_dir=shards_dir,
+        chunk_size=512,
+        stride=256,
+        max_images=1,
+        val_ratio=0.0,
+    )
+
+    viewer = WebDatasetViewer(
+        urls=shards_dir / "train",
+        stretch_type="leakysb",
+        save_dir=preview_dir,
+    )
+
+    sample = viewer.get_sample(0)
+    assert sample is not None
+    assert "raw" in sample and "target" in sample and "meta" in sample
+
+    exported = viewer.export_previews(count=2)
+    assert len(exported) > 0
+    assert exported[0].exists()
+
