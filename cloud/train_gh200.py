@@ -125,10 +125,7 @@ def main():
     args = parser.parse_args()
 
     # Hardware verification
-    if not torch.cuda.is_available():
-        logger.warning("CUDA not detected! Running on CPU fallback.")
-        device = "cpu"
-    else:
+    if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         cpu_count = os.cpu_count() or 1
@@ -137,6 +134,12 @@ def main():
         logger.info("  -> NVLink-C2C active: 900 GB/s bidirectional host-to-device streaming")
         logger.info("  -> Enabling TensorFloat-32 (TF32) and bfloat16 AMP")
         device = "cuda"
+    elif torch.backends.mps.is_available():
+        logger.info("[Apple Silicon] MPS accelerator active (Metal Performance Shaders FP32)")
+        device = "mps"
+    else:
+        logger.warning("CUDA/MPS not detected! Running on CPU fallback.")
+        device = "cpu"
 
     # Handle S3 downloads if needed
     train_shards = args.train_shards

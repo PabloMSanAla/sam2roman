@@ -93,6 +93,28 @@ def test_build_webdataset_and_loader(synthetic_fits_dir, tmp_path):
         assert lbl in (0, 1, 2)
 
 
+def test_build_webdataset_max_images(synthetic_fits_dir, tmp_path):
+    images_dir, masks_dir = synthetic_fits_dir
+    output_dir = tmp_path / "shards_limited"
+
+    # Only process 1 image out of the 2 synthetic pairs
+    summary = build_webdataset(
+        images_dir=images_dir,
+        masks_dir=masks_dir,
+        output_dir=output_dir,
+        chunk_size=512,
+        stride=256,
+        max_images=1,
+        val_ratio=0.0,
+    )
+
+    assert summary["max_images"] == 1
+    assert summary["train_exposures"] == 1
+    assert summary["val_exposures"] == 0
+    assert summary["train_cutouts"] > 0
+    assert summary["total_cutouts"] == summary["train_cutouts"]
+
+
 def test_gpu_leaky_sb_parity():
     """Verify GPULeakySB matches CPU leakySB analytical formulation."""
     np.random.seed(42)

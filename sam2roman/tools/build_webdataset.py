@@ -243,6 +243,7 @@ def build_webdataset(
     stride: Optional[int] = None,
     min_objects: int = 1,
     val_ratio: float = 0.2,
+    max_images: Optional[int] = None,
     max_samples_per_file: Optional[int] = None,
     max_samples_per_shard: int = 1000,
     target_mode: str = "dense_3class",
@@ -260,12 +261,16 @@ def build_webdataset(
     if not pairs:
         raise ValueError(f"No matching FITS pairs found between '{images_dir}' and '{masks_dir}'")
 
+    if max_images is not None and max_images > 0:
+        logger.info(f"Limiting dataset to first {max_images} input exposure images (out of {len(pairs)} matched).")
+        pairs = pairs[:max_images]
+
     logger.info(f"Matched {len(pairs)} exposure pairs. Splitting train/val with seed={seed}...")
     random.seed(seed)
     shuffled_pairs = list(pairs)
     random.shuffle(shuffled_pairs)
 
-    n_val = max(1, int(len(shuffled_pairs) * val_ratio)) if len(shuffled_pairs) > 1 else 0
+    n_val = max(1, int(len(shuffled_pairs) * val_ratio)) if (len(shuffled_pairs) > 1 and val_ratio > 0.0) else 0
     n_train = len(shuffled_pairs) - n_val
 
     train_pairs = shuffled_pairs[:n_train]
@@ -311,6 +316,7 @@ def build_webdataset(
         "chunk_size": chunk_size,
         "stride": stride or (chunk_size * 3 // 4),
         "target_mode": target_mode,
+        "max_images": max_images,
         "train_exposures": len(train_pairs),
         "val_exposures": len(val_pairs),
         "train_cutouts": train_count,
@@ -360,6 +366,14 @@ def main():
         help="Fraction of exposures allocated to validation (default: 0.2).",
     )
     parser.add_argument(
+        "--max_images",
+        "--max_files",
+        type=int,
+        default=None,
+        dest="max_images",
+        help="Maximum number of input exposure images (FITS file pairs) to slice (default: None for all).",
+    )
+    parser.add_argument(
         "--samples_per_file",
         type=int,
         default=None,
@@ -396,6 +410,7 @@ def main():
         stride=args.stride,
         min_objects=args.min_objects,
         val_ratio=args.val_ratio,
+        max_images=args.max_images,
         max_samples_per_file=args.samples_per_file,
         max_samples_per_shard=args.max_samples_per_shard,
         target_mode=args.target_mode,
