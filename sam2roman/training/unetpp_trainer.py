@@ -6,6 +6,7 @@ Optimized automatically for Apple Silicon MPS and NVIDIA CUDA GPUs (A100 / L4 / 
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -23,6 +24,34 @@ from sam2roman.training.gpu_transforms import GPUAstroTransform
 from sam2roman.training.webdataset_loader import create_webdataset_loader
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_dataset_size_string(dataset: Any, is_train: bool = True) -> str:
+    """Format human-readable dataset sample count (resolves WebDataset manifest when available)."""
+    if dataset is None:
+        return "None"
+    if not isinstance(dataset, (str, Path)) and hasattr(dataset, "__len__"):
+        return f"{len(dataset):,}"
+
+    if isinstance(dataset, (str, Path)):
+        ds_str = str(dataset)
+        base_path = Path(ds_str.split("*")[0]).resolve()
+        for candidate_dir in [base_path, base_path.parent, base_path.parent.parent]:
+            manifest_file = candidate_dir / "manifest.json"
+            if manifest_file.exists():
+                try:
+                    with open(manifest_file, "r") as f:
+                        meta = json.load(f)
+                    key = "train_cutouts" if is_train else "val_cutouts"
+                    if key in meta:
+                        return f"{meta[key]:,} (streaming WebDataset via manifest)"
+                    elif "total_cutouts" in meta:
+                        return f"{meta['total_cutouts']:,} (streaming WebDataset)"
+                except Exception:
+                    pass
+        return "Streaming WebDataset"
+
+    return "Streaming DataLoader"
 
 
 class UNetPPTrainer:
@@ -448,12 +477,8 @@ class UNetPPTrainer:
         best_val_loss = float("inf")
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
-        n_train_str = f"{len(dataset):,}" if hasattr(dataset, "__len__") else "Streaming WebDataset"
-        n_val_str = (
-            f"{len(val_dataset):,}"
-            if (val_dataset is not None and hasattr(val_dataset, "__len__"))
-            else ("Streaming WebDataset" if val_dataset is not None else "None")
-        )
+        n_train_str = _resolve_dataset_size_string(dataset, is_train=True)
+        n_val_str = _resolve_dataset_size_string(val_dataset, is_train=False)
 
         if verbose:
             print(f"[sam2roman] Starting UNet++ training for {epochs} epochs on {self.device}...")
