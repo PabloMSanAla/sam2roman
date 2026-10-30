@@ -297,10 +297,22 @@ class GPUAstroTransform(nn.Module):
         self,
         stretch_kwargs: Optional[dict] = None,
         aug_kwargs: Optional[dict] = None,
+        soften_boundaries: bool = False,
+        boundary_sigma: float = 1.2,
     ):
         super().__init__()
         self.stretch = GPULeakySB(**(stretch_kwargs or {}))
         self.aug = GPUAstroAugmentation(**(aug_kwargs or {}))
+        self.soften_boundaries = soften_boundaries
+        self.boundary_sigma = boundary_sigma
+
+        # Precompute Gaussian blur kernel for on-the-fly GPU edge softening
+        ksize = 5
+        coords = torch.arange(ksize, dtype=torch.float32) - (ksize - 1) / 2
+        gy, gx = torch.meshgrid(coords, coords, indexing="ij")
+        kernel = torch.exp(-(gx**2 + gy**2) / (2 * boundary_sigma**2))
+        kernel = kernel / kernel.sum()
+        self.register_buffer("gaussian_kernel", kernel.view(1, 1, ksize, ksize))
 
     def forward(
         self,
@@ -315,7 +327,7 @@ class GPUAstroTransform(nn.Module):
         raw : torch.Tensor
             Raw detector counts of shape (B, 1, H, W) or (B, H, W).
         target : torch.Tensor, optional
-            Target labels of shape (B, H, W).
+            Target labels of shape (B, H, W) or (B, 3, H, W).
 
         Returns
         -------
@@ -324,4 +336,13 @@ class GPUAstroTransform(nn.Module):
         """
         raw_aug, target_aug = self.aug(raw, target)
         images = self.stretch(raw_aug)
+
+        # On-the-fly GPU edge softening: convert discrete (B, H, W) to probability simplex (B, 3, H, W)
+        if self.soften_boundaries and target_aug is not None and target_aug.ndim == 3:
+            one_hot = torch.nn.functional.one_hot(target_aug.clamp(0, 2), num_classes=3).permute(0, 3, 1, 2).float()
+            k = self.gaussian_kernel.to(device=target_aug.device, dtype=torch.float32)
+            smooth_edge = torch.nn.functional.conv2d(one_hot[:, 2:3], k, padding=2)
+            one_hot[:, 2:3] = torch.clamp(smooth_edge * 1.5, 0.0, 1.0)
+            target_aug = one_hot / torch.clamp(one_hot.sum(dim=1, keepdim=True), min=1e-6)
+
         return images, target_aug

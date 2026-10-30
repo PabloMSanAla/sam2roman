@@ -147,6 +147,18 @@ def main():
         default=True,
         help="Enable GPU astronomical noise injection (Poisson shot + Gaussian read noise).",
     )
+    parser.add_argument(
+        "--soft_boundary",
+        action="store_true",
+        default=False,
+        help="Enable on-the-fly GPU Gaussian smoothing of boundaries from discrete WebDataset targets.",
+    )
+    parser.add_argument(
+        "--boundary_sigma",
+        type=float,
+        default=1.2,
+        help="Gaussian sigma for edge smoothing (default: 1.2).",
+    )
 
     args = parser.parse_args()
 
@@ -198,6 +210,8 @@ def main():
             "sky_pedestal_prob": 0.5,
             "flux_scale_prob": 0.5,
         },
+        soften_boundaries=args.soft_boundary,
+        boundary_sigma=args.boundary_sigma,
     ).to(device)
 
     # Initialize UNet++ Trainer with GPU transforms and edge-prioritized balanced composite loss
