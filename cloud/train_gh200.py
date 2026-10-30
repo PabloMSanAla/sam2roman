@@ -165,6 +165,13 @@ def main():
         default=1,
         help="Pixel distance tolerance for relaxed boundary IoU validation (default: 1 px).",
     )
+    parser.add_argument(
+        "--class_weights",
+        type=float,
+        nargs=3,
+        default=[0.5, 2.5, 8.0],
+        help="Class loss balancing weights [sky, interior, boundary] (default: 0.5 2.5 8.0).",
+    )
 
     args = parser.parse_args()
 
@@ -228,7 +235,7 @@ def main():
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         grad_clip_norm=args.grad_clip_norm,
-        class_weights=(0.5, 2.5, 8.0),
+        class_weights=tuple(args.class_weights),
         boundary_tolerance=args.boundary_tolerance,
         gpu_transform=gpu_transform,
         device=device,
