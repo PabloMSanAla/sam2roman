@@ -11,28 +11,45 @@
 # Reference: https://www.nas.nasa.gov/hecc/support/kb/machine-learning-overview_572.html
 # ==============================================================================
 
-module purge
-module use -a /swbuild/analytix/tools/modulefiles
-module load miniconda3/gh2
-source activate pyt2_5_gh
+# 1. Initialize NAS environment modules in subshell
+if [ -f /usr/local/lib/global.profile ]; then
+    source /usr/local/lib/global.profile
+elif [ -f /usr/share/modules/init/bash ]; then
+    source /usr/share/modules/init/bash
+fi
+
+module purge 2>/dev/null || true
+module use -a /swbuild/analytix/tools/modulefiles 2>/dev/null || true
+module load miniconda3/gh2 2>/dev/null || true
+
+# 2. Activate Grace Hopper PyTorch environment
+if command -v conda &> /dev/null; then
+    source activate pyt2_5_gh 2>/dev/null || conda activate pyt2_5_gh 2>/dev/null || true
+elif [ -f /swbuild/analytix/tools/miniconda3_241216/bin/activate ]; then
+    source /swbuild/analytix/tools/miniconda3_241216/bin/activate pyt2_5_gh
+fi
+
+# Resolve Python binary (ensure we use pyt2_5_gh and NOT system /usr/bin/python)
+if [ -x /swbuild/analytix/tools/miniconda3_241216/envs/pyt2_5_gh/bin/python ]; then
+    PYTHON_BIN="/swbuild/analytix/tools/miniconda3_241216/envs/pyt2_5_gh/bin/python"
+else
+    PYTHON_BIN="$(which python)"
+fi
 
 # Optimize CPU threading and output flushing
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 
-
 echo "================================================================="
 echo " Job started on: $(hostname) at $(date)"
-echo " CUDA Device: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)"
+echo " CUDA Device: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
+echo " Python Binary: $($PYTHON_BIN -c 'import sys; print(sys.executable)')"
+echo " Python Version: $($PYTHON_BIN --version 2>&1)"
 echo " Working directory: $(pwd)"
 echo "================================================================="
-# -----------------------------------------------------------------------------
-# Launch StarNet3 Training
-# -----------------------------------------------------------------------------
-
 
 # 3. Launch GH200 High-Throughput Training
-python /nobackup/pmsanch1/code/sam2roman/cloud/train_gh200.py \
+$PYTHON_BIN /nobackup/pmsanch1/code/sam2roman/cloud/train_gh200.py \
     --train_shards /nobackup/pmsanch1/data/webdataset_all/train/*tar \
     --val_shards /nobackup/pmsanch1/data/webdataset_all/val/*.tar \
     --output_dir /nobackup/pmsanch1/experiments/unet_gh200_80epochs \

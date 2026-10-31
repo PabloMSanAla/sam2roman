@@ -32,11 +32,17 @@ fi
 
 # 3. Load NAS Modules
 echo -e "\n[Step 3/5] Loading NAS Grace Hopper miniconda module..."
-if command -v module &> /dev/null || [ -f /usr/share/modules/init/bash ]; then
-    [ -f /usr/share/modules/init/bash ] && source /usr/share/modules/init/bash
+if [ -f /usr/local/lib/global.profile ]; then
+    source /usr/local/lib/global.profile
+elif [ -f /usr/share/modules/init/bash ]; then
+    source /usr/share/modules/init/bash
+fi
+
+if command -v module &> /dev/null; then
     module use -a /swbuild/analytix/tools/modulefiles
     module load miniconda3/gh2
-    echo "Loaded module: miniconda3/gh2"
+    source activate pyt2_5_gh 2>/dev/null || conda activate pyt2_5_gh 2>/dev/null || true
+    echo "Loaded module: miniconda3/gh2 (pyt2_5_gh)"
 else
     echo "[Notice] 'module' command not available in subshell; assuming environment is already loaded."
 fi
