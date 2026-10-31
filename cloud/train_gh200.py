@@ -132,8 +132,8 @@ def main():
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=4,
-        help="DataLoader worker processes (4 recommended on Grace ARM CPU).",
+        default=8,
+        help="DataLoader worker processes (sweet spot is 8-16 on GH200 72-core ARM CPU; note: num_workers must be <= number of WebDataset shards).",
     )
     parser.add_argument(
         "--shuffle_buffer",

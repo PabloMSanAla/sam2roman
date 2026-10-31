@@ -446,14 +446,17 @@ class UNetPPTrainer:
                 pin_memory=pin_memory,
             )
         else:
-            train_loader = DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=shuffle,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=self.collate_fn,
-            )
+            train_kwargs: Dict[str, Any] = {
+                "batch_size": batch_size,
+                "shuffle": shuffle,
+                "num_workers": num_workers,
+                "pin_memory": pin_memory,
+                "collate_fn": self.collate_fn,
+            }
+            if num_workers > 0:
+                train_kwargs["persistent_workers"] = True
+                train_kwargs["prefetch_factor"] = 2
+            train_loader = DataLoader(dataset, **train_kwargs)
 
         # Build or wrap validation DataLoader
         if val_dataset is None:
@@ -469,14 +472,17 @@ class UNetPPTrainer:
                 pin_memory=pin_memory,
             )
         else:
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=self.collate_fn,
-            )
+            val_kwargs: Dict[str, Any] = {
+                "batch_size": batch_size,
+                "shuffle": False,
+                "num_workers": num_workers,
+                "pin_memory": pin_memory,
+                "collate_fn": self.collate_fn,
+            }
+            if num_workers > 0:
+                val_kwargs["persistent_workers"] = True
+                val_kwargs["prefetch_factor"] = 2
+            val_loader = DataLoader(val_dataset, **val_kwargs)
 
         history: Dict[str, List[float]] = {
             "train_loss": [],

@@ -118,6 +118,8 @@ def create_webdataset_loader(
     num_workers: int = 4,
     pin_memory: Optional[bool] = None,
     drop_last: bool = True,
+    prefetch_factor: Optional[int] = None,
+    persistent_workers: Optional[bool] = None,
 ) -> DataLoader:
     """
     Build a high-performance streaming DataLoader over WebDataset shards.
@@ -133,11 +135,16 @@ def create_webdataset_loader(
     shuffle_buffer : int, default 1000
         Size of the in-memory window for i.i.d. random sample extraction.
     num_workers : int, default 4
-        Background subprocesses for prefetching. (Use 0 for simple tests or on macOS).
+        Background subprocesses for prefetching. On GH200 (72 ARM cores), 8–16
+        workers is the sweet spot. Note: num_workers should be <= number of shards.
     pin_memory : bool, optional
         Pin memory in host RAM for fast non-blocking DMA copies to GPU. Defaults to True if CUDA is available.
     drop_last : bool, default True
         Drop incomplete final batch.
+    prefetch_factor : int, optional
+        Number of batches loaded in advance by each worker (default: 2 when num_workers > 0).
+    persistent_workers : bool, optional
+        Maintain worker processes across epochs to avoid re-spawn latency (default: True when num_workers > 0).
 
     Returns
     -------
@@ -146,6 +153,15 @@ def create_webdataset_loader(
     """
     shard_list = resolve_shard_urls(urls)
     logger.info(f"Initialized WebDataset loader with {len(shard_list)} shards (is_train={is_train}).")
+
+    # Shard-to-worker check
+    if num_workers > len(shard_list):
+        logger.warning(
+            f"[sam2roman] num_workers ({num_workers}) exceeds number of available shards ({len(shard_list)}). "
+            f"WebDataset distributes whole shards across workers, so {num_workers - len(shard_list)} workers will "
+            f"receive 0 shards and remain idle! To fully utilize {num_workers} workers, re-build WebDataset with a "
+            f"smaller --samples_per_file in sam2roman/tools/build_webdataset.py to generate >= {num_workers} shards."
+        )
 
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
@@ -160,13 +176,18 @@ def create_webdataset_loader(
     # Decode .npy and .json directly into NumPy arrays and dicts
     pipeline = pipeline.decode().to_tuple("raw.npy", "target.npy", "json")
 
-    loader = DataLoader(
-        pipeline,
-        batch_size=batch_size,
-        collate_fn=collate_webdataset_batch,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=drop_last if is_train else False,
-    )
+    loader_kwargs: Dict[str, Any] = {
+        "batch_size": batch_size,
+        "collate_fn": collate_webdataset_batch,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "drop_last": drop_last if is_train else False,
+    }
+
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True if persistent_workers is None else persistent_workers
+        loader_kwargs["prefetch_factor"] = 2 if prefetch_factor is None else prefetch_factor
+
+    loader = DataLoader(pipeline, **loader_kwargs)
 
     return loader
