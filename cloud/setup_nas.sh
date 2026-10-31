@@ -47,6 +47,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # Use --user (since /swbuild/analytix is read-only) and --no-cache-dir (to protect $HOME disk quota)
+# Explicitly enforce numpy<2 to avoid C-ABI conflict with NAS prebuilt erfa/PyTorch modules
+pip install --user --no-cache-dir "numpy<2"
 pip install --user --no-cache-dir -r cloud/requirements_nas.txt
 
 # Install sam2roman package in editable mode without overriding PyTorch
@@ -56,6 +58,7 @@ pip install --user --no-cache-dir --no-deps -e .
 echo -e "\n[Step 5/5] Validating Python environment and hardware acceleration..."
 python3 -c "
 import sys
+import numpy as np
 import torch
 import webdataset
 import astropy
@@ -63,6 +66,7 @@ import asdf
 
 print('=' * 60)
 print('Python:           ', sys.version.split()[0], f'({sys.platform})')
+print('NumPy:            ', np.__version__)
 print('PyTorch:          ', torch.__version__)
 print('CUDA Available:   ', torch.cuda.is_available())
 if torch.cuda.is_available():

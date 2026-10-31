@@ -43,7 +43,9 @@ astropy>=6.0.0
 asdf>=4.0.0
 
 # Scientific Computing, Matrix Math & Image Processing (ARM64 prebuilt manylinux wheels)
-numpy>=1.24.0
+# NOTE: Must be numpy<2.0.0 because NASA NAS system C-extensions (erfa, pyt2_5_gh PyTorch bindings)
+# were compiled against NumPy 1.x C ABI. NumPy 2.x breaks binary compatibility with them.
+numpy>=1.24.0,<2.0.0
 scipy>=1.11.0
 matplotlib>=3.8.0
 pillow>=10.0.0
