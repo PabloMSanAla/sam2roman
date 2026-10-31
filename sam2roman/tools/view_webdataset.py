@@ -40,6 +40,11 @@ for candidate in [Path(__file__).resolve().parent.parent.parent, Path.cwd()]:
 
 from sam2roman.io.fits import stretch_astro_image
 from sam2roman.training.webdataset_loader import resolve_shard_urls
+from sam2roman.inference.unetpp_segmentor import UNetPPSegmentor
+from sam2roman.training.gpu_transforms import GPULeakySB
+from sam2roman.training.metrics import compute_relaxed_boundary_iou
+import torch
+import torch.nn.functional as F
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,6 +68,7 @@ class WebDatasetViewer:
         mmin: float = 13.0,
         mmax: float = 32.0,
         max_cache: int = 500,
+        checkpoint: Optional[Union[str, Path]] = None,
         save_dir: Optional[Union[str, Path]] = None,
     ):
         self.stretch_type = stretch_type
@@ -73,6 +79,14 @@ class WebDatasetViewer:
         self.max_cache = max_cache
         self.save_dir = Path(save_dir or "./previews")
         self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        if checkpoint is not None:
+            logger.info(f"Loading UNet++ checkpoint for live comparison: {checkpoint}")
+            self.segmentor = UNetPPSegmentor.from_checkpoint(checkpoint)
+            self.leaky_gpu = GPULeakySB(out_channels=3)
+        else:
+            self.segmentor = None
+            self.leaky_gpu = None
 
         shard_list = resolve_shard_urls(urls)
         logger.info(f"Connecting to {len(shard_list)} shard archives...")
@@ -198,17 +212,55 @@ class WebDatasetViewer:
             axes[1].set_title(f"Instance Masks ({len(unique_labels)-1} sources)", fontsize=11, fontweight="bold")
         axes[1].axis("off")
 
-        # 3. Composite Overlay
-        overlay = self.make_overlay(stretched, target)
-        axes[2].imshow(overlay, origin="lower")
-        axes[2].set_title("Detection Overlay", fontsize=11, fontweight="bold")
+        if self.segmentor is not None:
+            raw_t = torch.from_numpy(raw).unsqueeze(0).unsqueeze(0).float()
+            img_norm = self.leaky_gpu(raw_t).to(self.segmentor.device)
+            with torch.no_grad():
+                logits = self.segmentor.model(img_norm)
+                if isinstance(logits, list):
+                    logits = logits[-1]
+                probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+                pred_classes = np.argmax(probs, axis=0)
 
-        # Draw primary centroid marker if available
-        if "primary_centroid" in meta:
-            cx, cy = meta["primary_centroid"]
-            axes[2].plot(cx, cy, "r+", markersize=14, markeredgewidth=2, label="Centroid")
-            axes[2].legend(loc="upper right", framealpha=0.6, fontsize=9)
-        axes[2].axis("off")
+            # 3. UNet++ Predicted Mask
+            axes[2].imshow(pred_classes, cmap=self.cmap_3class, norm=self.norm_3class, origin="lower")
+            p_int = (pred_classes == 1)
+            t_int = (target == 1)
+            core_iou = float(np.sum(p_int & t_int) / max(1, np.sum(p_int | t_int)))
+            axes[2].set_title(f"UNet++ Prediction\nCore IoU: {core_iou:.3f}", fontsize=11, fontweight="bold")
+            axes[2].axis("off")
+
+            # 4. Boundary Alignment Overlay
+            b_overlay = np.zeros((*raw.shape, 3), dtype=np.float32)
+            gray = np.clip(stretched, 0, 1) * 0.4
+            b_overlay[:, :, 0] = gray
+            b_overlay[:, :, 1] = gray
+            b_overlay[:, :, 2] = gray
+
+            gt_edge = (target == 2)
+            pred_edge = (pred_classes == 2)
+            b_overlay[gt_edge, 1] = 1.0   # Green
+            b_overlay[pred_edge, 0] = 1.0  # Red
+
+            t_edge_t = torch.from_numpy(gt_edge).unsqueeze(0)
+            p_edge_t = torch.from_numpy(pred_edge).unsqueeze(0)
+            rel_iou = compute_relaxed_boundary_iou(p_edge_t, t_edge_t, tolerance=1).item()
+
+            axes[3].imshow(b_overlay, origin="lower")
+            axes[3].set_title(f"Boundary Overlay (Rel IoU: {rel_iou:.3f})\nGreen: GT | Red: Pred | Yellow: Overlap", fontsize=11, fontweight="bold")
+            axes[3].axis("off")
+        else:
+            # 3. Composite Overlay
+            overlay = self.make_overlay(stretched, target)
+            axes[2].imshow(overlay, origin="lower")
+            axes[2].set_title("Detection Overlay", fontsize=11, fontweight="bold")
+
+            # Draw primary centroid marker if available
+            if "primary_centroid" in meta:
+                cx, cy = meta["primary_centroid"]
+                axes[2].plot(cx, cy, "r+", markersize=14, markeredgewidth=2, label="Centroid")
+                axes[2].legend(loc="upper right", framealpha=0.6, fontsize=9)
+            axes[2].axis("off")
 
         # Construct informative header
         sample_key = meta.get("sample_key", f"Sample #{self.current_idx + 1}")
@@ -228,7 +280,9 @@ class WebDatasetViewer:
 
     def show(self) -> None:
         """Launch interactive matplotlib viewer with Arrow key listener and GUI buttons."""
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5.5))
+        n_ax = 4 if self.segmentor is not None else 3
+        fig_sz = (19, 5.2) if self.segmentor is not None else (15, 5.5)
+        fig, axes = plt.subplots(1, n_ax, figsize=fig_sz)
         plt.subplots_adjust(left=0.04, right=0.96, top=0.88, bottom=0.15, wspace=0.08)
 
         # Navigation handlers
@@ -308,7 +362,9 @@ class WebDatasetViewer:
     def export_previews(self, count: int = 10) -> List[Path]:
         """Save a batch of static PNG previews (useful for headless / cloud runs)."""
         saved = []
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        n_ax = 4 if self.segmentor is not None else 3
+        fig_sz = (19, 5.2) if self.segmentor is not None else (15, 5.5)
+        fig, axes = plt.subplots(1, n_ax, figsize=fig_sz)
         plt.subplots_adjust(left=0.04, right=0.96, top=0.88, bottom=0.06, wspace=0.08)
 
         for i in range(count):
@@ -362,12 +418,20 @@ def main():
         help="Maximum in-memory sliding window cache size (default: 500).",
     )
 
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Optional path to UNet++ checkpoint (e.g. experiments/unet/test_1/unetpp_best.pt) for live side-by-side inference.",
+    )
+
     args = parser.parse_args()
 
     viewer = WebDatasetViewer(
         urls=args.shards,
         stretch_type=args.stretch,
         max_cache=args.max_cache,
+        checkpoint=args.checkpoint,
         save_dir=args.save_dir,
     )
 

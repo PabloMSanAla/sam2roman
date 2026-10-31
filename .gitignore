@@ -46,6 +46,7 @@ htmlcov/
 .cache/
 checkpoints/
 experiments/
+previews/
 *.pt
 *.pth
 *.bin
