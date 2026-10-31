@@ -46,12 +46,13 @@ echo -e "\n[Step 4/5] Installing supplemental dependencies from cloud/requiremen
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Use --user (since /swbuild/analytix is read-only) and --no-cache-dir (to protect $HOME disk quota)
-# Explicitly enforce numpy<2 to avoid C-ABI conflict with NAS prebuilt erfa/PyTorch modules
-pip install --user --no-cache-dir "numpy<2"
+# If numpy or astropy were previously installed in ~/.local, remove them to fall back to the system NAS build
+pip uninstall -y numpy astropy 2>/dev/null || true
+
+# Install supplemental dependencies from requirements_nas.txt
 pip install --user --no-cache-dir -r cloud/requirements_nas.txt
 
-# Install sam2roman package in editable mode without overriding PyTorch
+# Install sam2roman package in editable mode without overriding PyTorch or system packages
 pip install --user --no-cache-dir --no-deps -e .
 
 # 5. Verification

@@ -213,12 +213,12 @@ pip install --user --no-cache-dir --no-deps -e .
 | **`--no-cache-dir`** | **Critical**. Suppresses caching wheels in `~/.cache/pip`, preventing home directory quota lockouts on NAS storage. |
 | **`--no-deps`** | **Essential for `sam2roman`**. Prevents pip from replacing the custom NAS ARM64 CUDA-compiled PyTorch with a generic CPU wheel. |
 
-> [!WARNING]
-> **NumPy 2.x Compatibility on NAS:**
-> NASA's pre-compiled C-extensions in `/swbuild/analytix/` (including `erfa` and PyTorch) were compiled against the **NumPy 1.x C ABI**. Installing NumPy 2.x triggers `AttributeError: _ARRAY_API not found` and `ImportError: numpy.core.multiarray failed to import`.
-> If you encounter this, downgrade NumPy in user space:
+> [!NOTE]
+> **Pre-installed System Packages (`numpy`, `astropy`, `torch`):**
+> NASA's pre-compiled C-extensions in `/swbuild/analytix/` (including `erfa`, `astropy`, and PyTorch) are pre-installed against the **NumPy 1.x C ABI**. To avoid version conflicts, `numpy` and `astropy` are omitted from `requirements_nas.txt`.
+> If you previously installed a user-space NumPy or Astropy, remove them with:
 > ```bash
-> pip install --user --no-cache-dir "numpy<2"
+> pip uninstall -y numpy astropy
 > ```
 
 ### Step 3: Run Setup Script or Submit PBS Job
