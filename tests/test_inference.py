@@ -62,3 +62,103 @@ def test_segmentor_from_checkpoint(tmp_path):
     seg_init_ckpt = SAM2Segmentor(checkpoint_path=ckpt_file, device="cpu")
     assert seg_init_ckpt.model_wrapper is not None
 
+
+def test_asdf_image_mock(tmp_path):
+    import warnings
+    from sam2roman.io.asdf_io import ASDFImage, HAS_ASDF
+    from sam2roman.io.reader import load_astro_image
+
+    data = np.random.rand(64, 64).astype(np.float32) * 50.0
+    meta = {"test": 123}
+
+    img = ASDFImage(data=data, meta=meta)
+    assert img.shape == (64, 64)
+    rgb = img.to_rgb(stretch_type="leakysb")
+    assert rgb.shape == (64, 64, 3)
+    assert rgb.dtype == np.uint8
+
+    pil_img = img.to_pil(stretch_type="leakysb")
+    assert pil_img.size == (64, 64)
+
+    if HAS_ASDF:
+        import asdf
+        asdf_path = tmp_path / "test_scene.asdf"
+        tree = {
+            "roman": {
+                "data": data,
+                "meta": meta,
+            }
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            af = asdf.AsdfFile(tree)
+            af.write_to(asdf_path)
+
+        loaded = load_astro_image(asdf_path)
+        assert isinstance(loaded, ASDFImage)
+        assert loaded.shape == (64, 64)
+        assert np.allclose(loaded.data, data)
+
+
+def test_unetpp_predict_dense_direct_and_tiled():
+    import torch
+    from sam2roman.inference.unetpp_segmentor import UNetPPSegmentor
+
+    # Lightweight model on CPU
+    segmentor = UNetPPSegmentor(
+        features=(8, 16, 32, 64, 128),
+        device="cpu",
+    )
+
+    data = np.random.rand(128, 128).astype(np.float32) * 100.0
+
+    # 1. Direct unchunked inference
+    mask_dir, probs_dir, stretched_dir = segmentor.predict_dense(
+        image=data,
+        tile_size=0,
+        stretch_type="leakysb",
+        verbose=False,
+    )
+    assert mask_dir.shape == (128, 128)
+    assert probs_dir.shape == (3, 128, 128)
+    assert stretched_dir.shape == (128, 128)
+    assert set(np.unique(mask_dir)).issubset({0, 1, 2})
+
+    # 2. Tiled sliding window inference with cosine blending
+    mask_tiled, probs_tiled, stretched_tiled = segmentor.predict_dense(
+        image=data,
+        tile_size=64,
+        overlap=16,
+        batch_size=2,
+        stretch_type="leakysb",
+        verbose=False,
+    )
+    assert mask_tiled.shape == (128, 128)
+    assert probs_tiled.shape == (3, 128, 128)
+    assert stretched_tiled.shape == (128, 128)
+    assert set(np.unique(mask_tiled)).issubset({0, 1, 2})
+    # Probabilities should sum to ~1.0 across classes
+    prob_sums = np.sum(probs_tiled, axis=0)
+    assert np.allclose(prob_sums, 1.0, atol=1e-4)
+
+
+def test_two_panel_visualization(tmp_path):
+    import matplotlib.pyplot as plt
+    from sam2roman.visualization.display import plot_two_panel_prediction
+
+    stretched = np.random.rand(64, 64).astype(np.float32)
+    pred_mask = np.random.choice([0, 1, 2], size=(64, 64)).astype(np.uint8)
+
+    save_file = tmp_path / "test_two_panel.png"
+    fig = plot_two_panel_prediction(
+        stretched=stretched,
+        pred_mask=pred_mask,
+        title="Test 2-Panel Figure",
+        save_path=save_file,
+        dpi=100,
+    )
+    assert fig is not None
+    assert save_file.exists()
+    assert save_file.stat().st_size > 0
+    plt.close(fig)
+

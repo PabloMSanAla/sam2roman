@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+import matplotlib.patches as mpatches
 import numpy as np
 from PIL import Image
 
@@ -199,5 +201,115 @@ def plot_detection_summary(
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=200, bbox_inches="tight")
+
+    return fig
+
+
+def plot_two_panel_prediction(
+    stretched: np.ndarray,
+    pred_mask: np.ndarray,
+    title: Optional[str] = None,
+    save_path: Optional[Union[str, Path]] = None,
+    figsize: Tuple[int, int] = (16, 8),
+    dpi: int = 150,
+    cmap_img: str = "gray",
+    image_title: str = "Astronomical Image (LeakySB Stretch)",
+    mask_title: str = "Predicted Segmentation Mask (UNet++)",
+) -> plt.Figure:
+    """
+    Display or save a high-contrast side-by-side 2-panel figure showing:
+    1. LeakySB-stretched astronomical image.
+    2. Boundary-aware 3-class segmentation prediction (Sky, Core, Deblending Edge).
+
+    Parameters
+    ----------
+    stretched : np.ndarray
+        2D normalized [0, 1] astronomical image from leakySB.
+    pred_mask : np.ndarray
+        2D integer prediction mask with values 0 (Sky), 1 (Core), 2 (Boundary).
+    title : str, optional
+        Suptitle for the entire figure.
+    save_path : str or Path, optional
+        File path to save the generated figure.
+    figsize : Tuple[int, int], default (16, 8)
+        Width and height in inches.
+    dpi : int, default 150
+        Resolution for saved image.
+    cmap_img : str, default 'gray'
+        Colormap for the stretched astronomical image.
+    image_title : str, default 'Astronomical Image (LeakySB Stretch)'
+    mask_title : str, default 'Predicted Segmentation Mask (UNet++)'
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    h, w = stretched.shape
+    total_pixels = h * w
+    n_sky = int(np.sum(pred_mask == 0))
+    n_core = int(np.sum(pred_mask == 1))
+    n_edge = int(np.sum(pred_mask == 2))
+
+    pct_sky = 100.0 * n_sky / total_pixels
+    pct_core = 100.0 * n_core / total_pixels
+    pct_edge = 100.0 * n_edge / total_pixels
+
+    # Setup discrete 3-class colormap:
+    # 0: Sky background (#0b0d1b - Dark charcoal / navy)
+    # 1: Core interior (#00d4ff - Electric cyan)
+    # 2: Boundary edge (#ff3366 - Vivid coral red)
+    cmap_3class = ListedColormap(["#0b0d1b", "#00d4ff", "#ff3366"])
+    norm_3class = BoundaryNorm([-0.5, 0.5, 1.5, 2.5], cmap_3class.N)
+
+    # Subplots sharing x and y axes for linked interactive zoom/pan
+    fig, axes = plt.subplots(1, 2, figsize=figsize, sharex=True, sharey=True)
+
+    # Panel 1: LeakySB stretched image
+    im0 = axes[0].imshow(stretched, cmap=cmap_img, origin="lower")
+    axes[0].set_title(f"{image_title}\nDimension: {w} × {h} px", fontsize=12, fontweight="bold", pad=10)
+    axes[0].set_xlabel("Pixel X", fontsize=10)
+    axes[0].set_ylabel("Pixel Y", fontsize=10)
+    axes[0].grid(False)
+
+    # Add subtle colorbar for Panel 1
+    cbar0 = fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+    cbar0.set_label("Normalized SB Flux [0, 1]", fontsize=9)
+
+    # Panel 2: Predicted segmentation mask
+    im1 = axes[1].imshow(pred_mask, cmap=cmap_3class, norm=norm_3class, origin="lower")
+    axes[1].set_title(
+        f"{mask_title}\nCore: {pct_core:.2f}% | Edge: {pct_edge:.2f}% | Sky: {pct_sky:.2f}%",
+        fontsize=12,
+        fontweight="bold",
+        pad=10,
+    )
+    axes[1].set_xlabel("Pixel X", fontsize=10)
+    axes[1].grid(False)
+
+    # Legend for Panel 2
+    patches = [
+        mpatches.Patch(color="#0b0d1b", label="Sky Background (0)"),
+        mpatches.Patch(color="#00d4ff", label="Source Core (1)"),
+        mpatches.Patch(color="#ff3366", label="Deblending Edge (2)"),
+    ]
+    axes[1].legend(
+        handles=patches,
+        loc="upper right",
+        framealpha=0.85,
+        facecolor="#1c2038",
+        edgecolor="#444b6e",
+        fontsize=9,
+        labelcolor="white",
+    )
+
+    if title:
+        fig.suptitle(title, fontsize=14, fontweight="bold", y=0.98)
+
+    plt.tight_layout()
+
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
 
     return fig

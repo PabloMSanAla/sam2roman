@@ -46,8 +46,14 @@ dependencies = [
     "matplotlib>=3.8.0",
     "pillow>=10.0.0",
     "tqdm>=4.66.0",
-    "webdataset>=1.0.0"
+    "webdataset>=1.0.0",
+    "asdf>=4.0.0"
 ]
+
+[project.scripts]
+sam2roman-predict = "sam2roman.tools.predict_image:main"
+sam2roman-view-wds = "sam2roman.tools.view_webdataset:main"
+sam2roman-build-wds = "sam2roman.tools.build_webdataset:main"
 
 [project.optional-dependencies]
 dev = [
