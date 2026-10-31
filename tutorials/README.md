@@ -63,6 +63,18 @@ Interactive walkthroughs and reproducible examples for running and fine-tuning M
 
 ---
 
+### [Tutorial 06: Full-Image Astronomical Inference with UNet++ & LeakySB](06_unetpp_fits_inference.ipynb)
+- **Files**: Notebook ([`06_unetpp_fits_inference.ipynb`](06_unetpp_fits_inference.ipynb)) and CLI script ([`06_unetpp_fits_inference.py`](06_unetpp_fits_inference.py))
+- **Key Concepts**:
+  1. **Unified FITS & ASDF I/O**: Reading science pixel data, physical moments, and celestial WCS headers.
+  2. **Leaky Surface Brightness (`leakySB`) Stretch**: Normalizing astronomical images across $>10^5$ dynamic range.
+  3. **Tiled Dense Inference (`predict_dense`)**: Sliding-window execution with 2D cosine window blending for seamless full-frame inference on arbitrary image sizes (including 4088x4088 Roman WFI exposures).
+  4. **Publication 2-Panel Diagnostic Figures**: Side-by-side display of the LeakySB image and the discrete 3-class segmentation map (Sky, Core, Deblending Edge).
+  5. **Crowded Field Cutout Inspection**: Zooming into high-density regions to verify 1-2 pixel contact boundary resolution.
+  6. **Watershed Deblending & Export**: Converting probability maps into discrete source catalogs (`segment_image`) and exporting multi-extension FITS with a `PRED_MASK` HDU.
+
+---
+
 ## Running the Tutorials
 
 ### Method 1: Interactive JupyterLab
@@ -91,4 +103,7 @@ python tutorials/04_segment_everything_finetuned.py
 
 # Run Tutorial 05 (Boundary-Aware UNet++ Training & Deblending)
 python tutorials/05_train_unetplusplus.py
+
+# Run Tutorial 06 (Full-Image Inference & LeakySB Visualization)
+python tutorials/06_unetpp_fits_inference.py
 ```
