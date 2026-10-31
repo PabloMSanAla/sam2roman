@@ -172,3 +172,55 @@ python cloud/train_gh200.py \
     --num_workers 4 \
     --noise_aug
 ```
+
+---
+
+## 9. NASA Advanced Supercomputing (NAS) Grace Hopper (GH200) Setup
+
+NASA HECC systems (such as the **Cabeus** cluster with Grace Hopper nodes) provide pre-built machine learning modules tailored to the **ARM64 (aarch64)** architecture:
+
+* **NAS Knowledge Base Reference**: [Machine Learning: Overview (KB 572)](https://www.nas.nasa.gov/hecc/support/kb/machine-learning-overview_572.html)
+
+### Step 1: Load the NAS Grace Hopper Miniconda Module
+Grace Hopper nodes use ARM architecture, so standard x86_64 environments will not run. Load the dedicated `gh2` module:
+
+```bash
+module use -a /swbuild/analytix/tools/modulefiles
+module load miniconda3/gh2
+```
+
+Inspect available environments:
+```bash
+conda info --envs
+source activate <target_environment>
+```
+
+### Step 2: Install Supplemental Packages via `pip` (Required Flags)
+Because `/swbuild/analytix/` is a shared, read-only system directory and NAS accounts enforce strict `$HOME` disk quotas (typically 25–50 GB), you **must** supply specific flags:
+
+```bash
+# Install supplemental dependencies in user space without consuming disk cache
+pip install --user --no-cache-dir -r cloud/requirements_nas.txt
+
+# Install sam2roman in editable mode without re-evaluating or overriding PyTorch
+pip install --user --no-cache-dir --no-deps -e .
+```
+
+#### Why These Flags Are Required:
+| Flag | Requirement Reason |
+| :--- | :--- |
+| **`--user`** | **Mandatory**. The shared NAS environment in `/swbuild/analytix/` is read-only. Installs packages into `$HOME/.local/lib/python3.X/site-packages`. |
+| **`--no-cache-dir`** | **Critical**. Suppresses caching wheels in `~/.cache/pip`, preventing home directory quota lockouts on NAS storage. |
+| **`--no-deps`** | **Essential for `sam2roman`**. Prevents pip from replacing the custom NAS ARM64 CUDA-compiled PyTorch with a generic CPU wheel. |
+
+### Step 3: Run Setup Script or Submit PBS Job
+You can run the automated setup script on a compute node:
+```bash
+bash cloud/setup_nas.sh
+```
+
+Or submit a PBS batch job using [`cloud/job_gh200_nas.pbs`](file:///Users/pmsanch1/code/sam2roman/cloud/job_gh200_nas.pbs):
+```bash
+qsub cloud/job_gh200_nas.pbs
+```
+

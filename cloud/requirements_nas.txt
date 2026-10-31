@@ -1,0 +1,61 @@
+# ==============================================================================
+# NASA Advanced Supercomputing (NAS) HECC - Grace Hopper (GH200) Requirements
+# ==============================================================================
+# Target System: NASA HECC Grace Hopper Nodes (Cabeus / Aitken / Lou)
+# Architecture: ARM64 (aarch64) Grace CPU (72 cores) + Hopper H100 (96GB/144GB)
+# Reference: https://www.nas.nasa.gov/hecc/support/kb/machine-learning-overview_572.html
+#
+# ------------------------------------------------------------------------------
+# STEP 1: Load the NAS Grace Hopper Miniconda module:
+#   module use -a /swbuild/analytix/tools/modulefiles
+#   module load miniconda3/gh2
+#
+# STEP 2: View and activate the prebuilt GPU-enabled ML environment:
+#   conda info --envs
+#   source activate <conda_environment>   # e.g. source activate base or ml_gh2
+#
+# STEP 3: Install supplemental packages using pip with the required flags:
+#   pip install --user --no-cache-dir -r cloud/requirements_nas.txt
+#
+# STEP 4: Install sam2roman in editable mode without overriding PyTorch:
+#   pip install --user --no-cache-dir --no-deps -e .
+# ------------------------------------------------------------------------------
+#
+# REQUIRED PIP FLAGS EXPLANATION:
+#   --user         : MANDATORY. The system module in /swbuild/analytix/ is read-only.
+#                    Installs packages to $HOME/.local/lib/python3.X/site-packages.
+#   --no-cache-dir : CRITICAL. Disables caching in ~/.cache/pip to strictly preserve
+#                    NAS $HOME disk quotas (typically limited to 25-50 GB).
+#
+# NOTE ON PYTORCH:
+#   The NAS miniconda3/gh2 module already provides PyTorch compiled natively
+#   for ARM64 (aarch64) with NVIDIA Hopper H100 SM90 CUDA support.
+#   Do NOT reinstall torch from standard PyPI wheels. If building a standalone
+#   conda env, use:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# ==============================================================================
+
+# High-Throughput Sharded Dataset Streaming (NVLink-C2C streaming directly from /dev/shm)
+webdataset>=1.0.0
+
+# Astronomical FITS and Roman Space Telescope Level 2 ASDF Handling
+astropy>=6.0.0
+asdf>=4.0.0
+
+# Scientific Computing, Matrix Math & Image Processing (ARM64 prebuilt manylinux wheels)
+numpy>=1.24.0
+scipy>=1.11.0
+matplotlib>=3.8.0
+pillow>=10.0.0
+
+# Training Execution, Progress Monitoring & Distributed Accelerations
+tqdm>=4.66.0
+accelerate>=0.30.0
+
+# Vision Transformers & Foundation Model Weights (SAM 2)
+transformers>=4.50.0
+huggingface_hub>=0.24.0
+
+# Optional: Astronomical Photometry & Cloud Storage Sync
+photutils>=1.12.0
+boto3>=1.34.0

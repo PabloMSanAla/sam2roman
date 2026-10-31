@@ -1,0 +1,46 @@
+#PBS -S /bin/bash
+#PBS -N sam2roman_gh200
+#PBS -l select=1:ncpus=72:ngpus=1:mem=460GB:model=gh200
+#PBS -l walltime=04:00:00
+#PBS -j oe
+#PBS -m abe
+# ==============================================================================
+# NASA HECC Grace Hopper (GH200) Batch Training Job
+# Reference: https://www.nas.nasa.gov/hecc/support/kb/machine-learning-overview_572.html
+# ==============================================================================
+
+echo "Job starting on $(hostname) at $(date)"
+echo "PBS Job ID: $PBS_JOBID"
+echo "Working directory: $PBS_O_WORKDIR"
+cd "$PBS_O_WORKDIR"
+
+# 1. Load NAS Grace Hopper module environment
+module use -a /swbuild/analytix/tools/modulefiles
+module load miniconda3/gh2
+
+# 2. Stage WebDataset Shards into Grace CPU RAM Disk (/dev/shm)
+# Staging to /dev/shm provides up to 512 GB/s memory bandwidth over NVLink-C2C
+SHM_DIR="/dev/shm/roman_webdataset"
+mkdir -p "$SHM_DIR"
+
+if [ -d "$DATA_SRC/train" ]; then
+    echo "Staging shards from $DATA_SRC to $SHM_DIR (/dev/shm RAM disk)..."
+    rsync -av "$DATA_SRC/train" "$SHM_DIR/"
+    rsync -av "$DATA_SRC/val" "$SHM_DIR/"
+fi
+
+# 3. Launch GH200 High-Throughput Training
+python cloud/train_gh200.py \
+    --train_shards "$SHM_DIR/train/*.tar" \
+    --val_shards "$SHM_DIR/val/*.tar" \
+    --output_dir "$PBS_O_WORKDIR/experiments/unet_gh200" \
+    --batch_size 32 \
+    --epochs 20 \
+    --lr 6e-5 \
+    --soft_boundary \
+    --boundary_sigma 1.2 \
+    --boundary_tolerance 1 \
+    --noise_aug \
+    --amp_bf16
+
+echo "Job completed at $(date)"
