@@ -399,21 +399,24 @@ def plot_validation_examples(
     return out_p
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Construct CLI argument parser for train_gh200."""
     parser = argparse.ArgumentParser(
         description="High-Throughput Grace Hopper (GH200) Training for sam2roman."
     )
     parser.add_argument(
         "--train_shards",
         type=str,
+        nargs="+",
         required=True,
-        help="Path or glob pattern for training shards (e.g. '/dev/shm/train/train-*.tar' or 's3://...').",
+        help="Path, glob pattern, or list of training shards (e.g. '/dev/shm/train/train-*.tar' or 's3://...').",
     )
     parser.add_argument(
         "--val_shards",
         type=str,
+        nargs="+",
         default=None,
-        help="Optional path or glob pattern for validation shards.",
+        help="Optional path, glob pattern, or list of validation shards.",
     )
     parser.add_argument(
         "--output_dir",
@@ -520,7 +523,11 @@ def main():
         default=5,
         help="Epoch interval for updating training curves and generating fixed validation cutout inference figures (default: 5).",
     )
+    return parser
 
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     # Hardware verification
@@ -542,14 +549,20 @@ def main():
 
     # Handle S3 downloads if needed
     train_shards = args.train_shards
-    if train_shards.startswith("s3://"):
-        local_train = Path("/dev/shm/roman_shards/train") if Path("/dev/shm").exists() else Path("./data_shards/train")
-        train_shards = str(sync_s3_path(train_shards, local_train))
+    if len(train_shards) == 1:
+        if train_shards[0].startswith("s3://"):
+            local_train = Path("/dev/shm/roman_shards/train") if Path("/dev/shm").exists() else Path("./data_shards/train")
+            train_shards = str(sync_s3_path(train_shards[0], local_train))
+        else:
+            train_shards = train_shards[0]
 
     val_shards = args.val_shards
-    if val_shards and val_shards.startswith("s3://"):
-        local_val = Path("/dev/shm/roman_shards/val") if Path("/dev/shm").exists() else Path("./data_shards/val")
-        val_shards = str(sync_s3_path(val_shards, local_val))
+    if val_shards and len(val_shards) == 1:
+        if val_shards[0].startswith("s3://"):
+            local_val = Path("/dev/shm/roman_shards/val") if Path("/dev/shm").exists() else Path("./data_shards/val")
+            val_shards = str(sync_s3_path(val_shards[0], local_val))
+        else:
+            val_shards = val_shards[0]
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

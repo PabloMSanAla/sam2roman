@@ -27,15 +27,25 @@ from sam2roman.training.metrics import evaluate_batch_metrics
 logger = logging.getLogger(__name__)
 
 
+def _is_webdataset_shards(ds: Any) -> bool:
+    """Check if dataset argument represents WebDataset shard paths or patterns."""
+    if isinstance(ds, (str, Path)):
+        return True
+    if isinstance(ds, (list, tuple)) and len(ds) > 0 and isinstance(ds[0], (str, Path)):
+        return True
+    return False
+
+
 def _resolve_dataset_size_string(dataset: Any, is_train: bool = True) -> str:
     """Format human-readable dataset sample count (resolves WebDataset manifest when available)."""
     if dataset is None:
         return "None"
-    if not isinstance(dataset, (str, Path)) and hasattr(dataset, "__len__"):
+    if not _is_webdataset_shards(dataset) and hasattr(dataset, "__len__"):
         return f"{len(dataset):,}"
 
-    if isinstance(dataset, (str, Path)):
-        ds_str = str(dataset)
+    if _is_webdataset_shards(dataset):
+        first_shard = dataset if isinstance(dataset, (str, Path)) else dataset[0]
+        ds_str = str(first_shard)
         base_path = Path(ds_str.split("*")[0]).resolve()
         for candidate_dir in [base_path, base_path.parent, base_path.parent.parent]:
             manifest_file = candidate_dir / "manifest.json"
@@ -447,7 +457,7 @@ class UNetPPTrainer:
         # Build or wrap train DataLoader
         if isinstance(dataset, DataLoader):
             train_loader = dataset
-        elif isinstance(dataset, (str, Path)):
+        elif _is_webdataset_shards(dataset):
             train_loader = create_webdataset_loader(
                 urls=dataset,
                 batch_size=batch_size,
@@ -473,7 +483,7 @@ class UNetPPTrainer:
             val_loader = None
         elif isinstance(val_dataset, DataLoader):
             val_loader = val_dataset
-        elif isinstance(val_dataset, (str, Path)):
+        elif _is_webdataset_shards(val_dataset):
             val_loader = create_webdataset_loader(
                 urls=val_dataset,
                 batch_size=batch_size,

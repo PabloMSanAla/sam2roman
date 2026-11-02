@@ -218,3 +218,36 @@ def test_gh200_training_loop_5_epochs(tmp_path, dummy_dataset):
     # 4. JSON metrics
     assert (tmp_path / "training_metrics.json").exists()
 
+
+def test_train_gh200_cli_expanded_glob():
+    """Verify that multiple shards from unquoted shell glob expansion parse successfully."""
+    from cloud.train_gh200 import build_parser
+
+    # Simulate unquoted shell glob expansion where shell expands *.tar to multiple arguments
+    simulated_args = [
+        "--train_shards",
+        "train-000001.tar",
+        "train-000002.tar",
+        "train-000003.tar",
+        "--val_shards",
+        "val-000001.tar",
+        "val-000002.tar",
+        "--epochs",
+        "1",
+        "--batch_size",
+        "4",
+    ]
+
+    parser = build_parser()
+    args = parser.parse_args(simulated_args)
+
+    assert len(args.train_shards) == 3
+    assert args.train_shards == ["train-000001.tar", "train-000002.tar", "train-000003.tar"]
+    assert len(args.val_shards) == 2
+    assert args.val_shards == ["val-000001.tar", "val-000002.tar"]
+    assert args.epochs == 1
+    assert args.batch_size == 4
+    assert args.plot_interval == 5
+    assert args.log_file == "epoch_log.txt"
+
+

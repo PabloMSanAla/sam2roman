@@ -17,6 +17,7 @@ module use -a /swbuild/analytix/tools/modulefiles
 module load miniconda3/gh2
 source activate pyt2_6_gh 
 
+PYTHON_BIN="$(which python)"
 
 # Optimize CPU threading and output flushing
 export OMP_NUM_THREADS=2
@@ -31,9 +32,9 @@ echo " Working directory: $(pwd)"
 echo "================================================================="
 
 # 3. Launch GH200 High-Throughput Training
-python /nobackup/pmsanch1/code/sam2roman/cloud/train_gh200.py \
-    --train_shards /nobackup/pmsanch1/data/webdataset_all/train/*tar \
-    --val_shards /nobackup/pmsanch1/data/webdataset_all/val/*.tar \
+$PYTHON_BIN /nobackup/pmsanch1/code/sam2roman/cloud/train_gh200.py \
+    --train_shards "/nobackup/pmsanch1/data/webdataset_all/train/*tar" \
+    --val_shards "/nobackup/pmsanch1/data/webdataset_all/val/*.tar" \
     --output_dir /nobackup/pmsanch1/experiments/unet_gh200_80epochs \
     --batch_size 32 \
     --epochs 80 \
