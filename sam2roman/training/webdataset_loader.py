@@ -154,13 +154,13 @@ def create_webdataset_loader(
     shard_list = resolve_shard_urls(urls)
     logger.info(f"Initialized WebDataset loader with {len(shard_list)} shards (is_train={is_train}).")
 
-    # Shard-to-worker check
+    # Shard-to-worker check: WebDataset distributes whole shards across workers.
+    # Cap workers to number of shards to avoid spawning idle processes.
+    effective_workers = min(num_workers, len(shard_list))
     if num_workers > len(shard_list):
-        logger.warning(
-            f"[sam2roman] num_workers ({num_workers}) exceeds number of available shards ({len(shard_list)}). "
-            f"WebDataset distributes whole shards across workers, so {num_workers - len(shard_list)} workers will "
-            f"receive 0 shards and remain idle! To fully utilize {num_workers} workers, re-build WebDataset with a "
-            f"smaller --samples_per_file in sam2roman/tools/build_webdataset.py to generate >= {num_workers} shards."
+        logger.info(
+            f"[sam2roman] Capping DataLoader workers from {num_workers} to {effective_workers} "
+            f"(matching number of available shards: {len(shard_list)})."
         )
 
     if pin_memory is None:
@@ -179,12 +179,12 @@ def create_webdataset_loader(
     loader_kwargs: Dict[str, Any] = {
         "batch_size": batch_size,
         "collate_fn": collate_webdataset_batch,
-        "num_workers": num_workers,
+        "num_workers": effective_workers,
         "pin_memory": pin_memory,
         "drop_last": drop_last if is_train else False,
     }
 
-    if num_workers > 0:
+    if effective_workers > 0:
         loader_kwargs["persistent_workers"] = True if persistent_workers is None else persistent_workers
         loader_kwargs["prefetch_factor"] = 2 if prefetch_factor is None else prefetch_factor
 
