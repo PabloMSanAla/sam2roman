@@ -10,7 +10,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any, Union, List, Tuple
+from typing import Optional, Dict, Any, Union, List, Tuple, Callable
 
 import numpy as np
 import torch
@@ -365,6 +365,9 @@ class UNetPPTrainer:
         num_workers: int = 0,
         pin_memory: Optional[bool] = None,
         shuffle: bool = True,
+        log_file: Optional[Union[str, Path]] = "epoch_log.txt",
+        epoch_callback: Optional[Callable[[UNetPPTrainer, Dict[str, Any], Dict[str, List[float]]], None]] = None,
+        on_epoch_end: Optional[Callable[[UNetPPTrainer, Dict[str, Any], Dict[str, List[float]]], None]] = None,
     ) -> Dict[str, Any]:
         """
         Execute full training routine for UNet++.
@@ -385,7 +388,7 @@ class UNetPPTrainer:
         warmup_epochs : int, default 2
             Number of warmup epochs for cosine schedule to prevent validation bounce.
         output_dir : str or Path, optional
-            Directory to save checkpoints.
+            Directory to save checkpoints and training artifacts.
         verbose : bool, default True
             Print metrics and progress per epoch.
         num_workers : int, default 0
@@ -394,6 +397,13 @@ class UNetPPTrainer:
             Pin host memory for DMA transfers (defaults to True on CUDA).
         shuffle : bool, default True
             Whether to shuffle training crops every epoch.
+        log_file : str or Path, optional, default 'epoch_log.txt'
+            Filename inside output_dir to write epoch summary logs. Set to None to disable.
+        epoch_callback : callable, optional
+            Optional callback invoked at the end of each epoch with signature:
+            `callback(trainer, epoch_data, history)`.
+        on_epoch_end : callable, optional
+            Alias for `epoch_callback`.
         """
         if pin_memory is None:
             pin_memory = (self.device.type == "cuda")
@@ -520,6 +530,19 @@ class UNetPPTrainer:
                 print(f"  -> Apple Silicon MPS:   Metal Performance Shaders active (FP32)")
             print("-" * 75)
 
+        # Initialize log file if requested
+        if output_dir and log_file:
+            log_path = Path(output_dir) / log_file
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if not log_path.exists():
+                with open(log_path, "w") as f_log:
+                    f_log.write("=" * 75 + "\n")
+                    f_log.write("sam2roman UNet++ Training Log\n")
+                    f_log.write(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f_log.write(f"Device: {self.device} | Epochs: {epochs} | Batch size: {batch_size}\n")
+                    f_log.write(f"Train samples: {n_train_str} | Val samples: {n_val_str}\n")
+                    f_log.write("=" * 75 + "\n")
+
         for epoch in range(1, epochs + 1):
             t0 = time.time()
             current_lr = self.optimizer.param_groups[0]["lr"]
@@ -560,15 +583,66 @@ class UNetPPTrainer:
                 else:
                     self.scheduler.step()
 
+            log_line = (
+                f"Epoch [{epoch:02d}/{epochs:02d}] - LR: {current_lr:.2e} - "
+                f"Train Loss: {train_loss:.4f}{val_str} ({elapsed:.1f}s)"
+            )
+
             if verbose:
-                print(
-                    f"Epoch [{epoch:02d}/{epochs:02d}] - LR: {current_lr:.2e} - "
-                    f"Train Loss: {train_loss:.4f}{val_str} ({elapsed:.1f}s)"
-                )
+                print(log_line)
 
             if output_dir:
                 save_path = Path(output_dir) / f"unetpp_epoch_{epoch}.pt"
                 self.save_checkpoint(save_path)
+                if log_file:
+                    log_path = Path(output_dir) / log_file
+                    with open(log_path, "a") as f_log:
+                        f_log.write(log_line + "\n")
+                        f_log.flush()
+
+                # Continuously update training_metrics.json on each epoch
+                metrics_path = Path(output_dir) / "training_metrics.json"
+                try:
+                    with open(metrics_path, "w") as f_meta:
+                        json.dump(history, f_meta, indent=2)
+                except Exception as e:
+                    logger.debug(f"Failed to write training_metrics.json: {e}")
+
+            # Invoke optional callback
+            cb = epoch_callback or on_epoch_end
+            if cb is not None:
+                epoch_data = {
+                    "epoch": epoch,
+                    "epochs": epochs,
+                    "lr": current_lr,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_macro_iou": macro_iou if val_loader is not None else None,
+                    "val_interior_iou": int_iou if val_loader is not None else None,
+                    "val_boundary_iou": bound_iou if val_loader is not None else None,
+                    "val_strict_boundary_iou": (
+                        self.last_eval_metrics.get("strict_boundary_iou")
+                        if val_loader is not None
+                        else None
+                    ),
+                    "val_soft_boundary_iou": (
+                        self.last_eval_metrics.get("soft_boundary_iou")
+                        if val_loader is not None
+                        else None
+                    ),
+                    "elapsed": elapsed,
+                    "log_line": log_line,
+                }
+                cb(self, epoch_data, history)
+
+        if output_dir and log_file:
+            log_path = Path(output_dir) / log_file
+            with open(log_path, "a") as f_log:
+                f_log.write("-" * 75 + "\n")
+                f_log.write(f"Completed: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                if best_val_loss != float("inf"):
+                    f_log.write(f"Best Val Loss: {best_val_loss:.4f}\n")
+                f_log.write("=" * 75 + "\n")
 
         if verbose:
             print("-" * 75)

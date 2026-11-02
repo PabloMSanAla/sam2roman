@@ -170,8 +170,17 @@ python cloud/train_gh200.py \
     --epochs 20 \
     --lr 3e-4 \
     --num_workers 4 \
-    --noise_aug
+    --noise_aug \
+    --log_file epoch_log.txt \
+    --plot_interval 5
 ```
+
+### Generated Artifacts during GH200 Training:
+- `epoch_log.txt`: Real-time text log appending training loss, validation loss, and relaxed/strict/soft boundary IoUs at each epoch.
+- `training_metrics.json`: JSON file continuously updated with epoch metrics history.
+- `gh200_training_curves.png` & `training_curves_epoch_XXX.png`: Training convergence and validation IoU plots generated every 5 epochs (configurable via `--plot_interval`).
+- `val_inference_epoch_XXX.png` & `val_inference_latest.png`: Side-by-side evaluation grid of 4 fixed validation cutouts (Astronomical Image, Ground Truth Target, and UNet++ Predicted Segmentation Mask with IoU scores) generated every 5 epochs.
+- `unetpp_epoch_X.pt` & `unetpp_best.pt`: Model checkpoints.
 
 ---
 
