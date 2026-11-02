@@ -128,7 +128,7 @@ def extract_fixed_val_cutouts(
                 if hasattr(r, "convert"):  # PIL Image
                     r = np.array(r)
                 elif isinstance(r, torch.Tensor):
-                    r = r.squeeze().cpu().numpy()
+                    r = r.squeeze().float().cpu().numpy()
                 if isinstance(t, torch.Tensor):
                     t = t.squeeze().cpu().numpy()
                 m = s.get("meta", {})
@@ -155,7 +155,7 @@ def extract_fixed_val_cutouts(
                         if hasattr(item_r, "convert"):
                             r = np.array(item_r)
                         elif isinstance(item_r, torch.Tensor):
-                            r = item_r.squeeze().cpu().numpy()
+                            r = item_r.squeeze().float().cpu().numpy()
                         else:
                             r = np.asarray(item_r)
 
@@ -309,12 +309,13 @@ def plot_validation_examples(
         if isinstance(logits, list):
             logits = logits[-1]
 
-        probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+        # Explicitly cast to float32 before converting to NumPy (safeguards against BFloat16 AMP)
+        probs = torch.softmax(logits.float(), dim=1).squeeze(0).cpu().numpy()
         pred_classes = np.argmax(probs, axis=0)
 
         # Stretched image for display
         if img_norm.ndim == 4 and img_norm.shape[1] >= 1:
-            disp_img = img_norm[0, 0].detach().cpu().numpy()
+            disp_img = img_norm[0, 0].detach().float().cpu().numpy()
         else:
             disp_img = stretch_astro_image(raw, stretch_type="leakysb")
 

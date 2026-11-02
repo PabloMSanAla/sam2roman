@@ -159,6 +159,40 @@ def test_plot_validation_examples(tmp_path, dummy_dataset):
     assert img.size[1] > 500
 
 
+def test_plot_validation_examples_bfloat16(tmp_path, dummy_dataset):
+    """Verify 4-cutout grid figure generation when model outputs BFloat16 tensors."""
+    class BFloat16ModelWrapper(torch.nn.Module):
+        def __init__(self, base_model):
+            super().__init__()
+            self.base_model = base_model
+
+        def forward(self, x):
+            logits = self.base_model(x)
+            return logits.bfloat16()
+
+    base_model = UNetPlusPlus(
+        in_channels=3,
+        num_classes=3,
+        features=(8, 16, 32, 64, 128),
+    )
+    bf16_model = BFloat16ModelWrapper(base_model)
+    cutouts = extract_fixed_val_cutouts(dummy_dataset, num_cutouts=4)
+
+    out_path = tmp_path / "val_inference_epoch_bf16.png"
+    # Should execute cleanly without TypeError: Got unsupported ScalarType BFloat16
+    result = plot_validation_examples(
+        model=bf16_model,
+        fixed_cutouts=cutouts,
+        gpu_transform=None,
+        output_path=out_path,
+        epoch=5,
+        epochs=10,
+        device="cpu",
+    )
+    assert result.exists()
+    assert Image.open(result).size[0] > 0
+
+
 def test_gh200_training_loop_5_epochs(tmp_path, dummy_dataset):
     """Verify full end-to-end 5-epoch training loop with plots and cutout figures."""
     trainer = UNetPPTrainer(

@@ -219,7 +219,7 @@ class WebDatasetViewer:
                 logits = self.segmentor.model(img_norm)
                 if isinstance(logits, list):
                     logits = logits[-1]
-                probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+                probs = F.softmax(logits.float(), dim=1).squeeze(0).cpu().numpy()
                 pred_classes = np.argmax(probs, axis=0)
 
             # 3. UNet++ Predicted Mask

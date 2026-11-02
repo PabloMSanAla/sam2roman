@@ -173,7 +173,7 @@ class UNetPPSegmentor:
             logits = self.model(input_tensor)
             if isinstance(logits, list):
                 logits = logits[-1]
-            probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()  # (3, H, W)
+            probs = F.softmax(logits.float(), dim=1).squeeze(0).cpu().numpy()  # (3, H, W)
 
         fwd_time = time.time() - t_fwd
 
@@ -380,7 +380,7 @@ class UNetPPSegmentor:
                 logits = self.model(input_t)
                 if isinstance(logits, list):
                     logits = logits[-1]
-                probs = F.softmax(logits, dim=1).squeeze(0)[:, :h, :w].cpu().numpy()
+                probs = F.softmax(logits.float(), dim=1).squeeze(0)[:, :h, :w].cpu().numpy()
 
             pred_mask = np.argmax(probs, axis=0).astype(np.uint8)
             elapsed = time.time() - t0
@@ -434,7 +434,7 @@ class UNetPPSegmentor:
                 logits = self.model(batch_t)
                 if isinstance(logits, list):
                     logits = logits[-1]
-                batch_probs = F.softmax(logits, dim=1).cpu().numpy()
+                batch_probs = F.softmax(logits.float(), dim=1).cpu().numpy()
 
             for b_idx, (y, x) in enumerate(batch_coords):
                 is_top = (y == 0)
