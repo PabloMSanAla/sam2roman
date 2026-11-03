@@ -1,0 +1,54 @@
+#PBS -S /bin/bash
+#PBS -N sam2roman_segment_gh200
+#PBS -l select=1:ncpus=72:mpiprocs=1:model=gh200
+#PBS -l walltime=04:00:00
+#PBS -q gpu_normal
+#PBS -j oe
+#PBS -W group_list=s3371
+#PBS -o /nobackup/pmsanch1/segment_training.log
+# ==============================================================================
+# NASA HECC Grace Hopper (GH200) Batch Training Job: Center Offset Voting
+# Reference: https://www.nas.nasa.gov/hecc/support/kb/machine-learning-overview_572.html
+# ==============================================================================
+
+# 1. Initialize NAS environment modules in subshell
+module purge 
+module use -a /swbuild/analytix/tools/modulefiles 
+module load miniconda3/gh2
+source activate pyt2_6_gh 
+
+PYTHON_BIN="$(which python)"
+
+# Optimize CPU threading and output flushing
+export OMP_NUM_THREADS=2
+export PYTHONUNBUFFERED=1
+
+echo "================================================================="
+echo " Job started on: $(hostname) at $(date)"
+echo " CUDA Device: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
+echo " Python Binary: $($PYTHON_BIN -c 'import sys; print(sys.executable)')"
+echo " Python Version: $($PYTHON_BIN --version 2>&1)"
+echo " Working directory: $(pwd)"
+echo "================================================================="
+
+# 2. Launch GH200 Center Offset Voting Training
+$PYTHON_BIN /nobackup/pmsanch1/code/sam2roman/cloud/train_segment_gh200.py \
+    --train_shards "/nobackup/pmsanch1/data/webdataset_instance/train/*.tar" \
+    --val_shards "/nobackup/pmsanch1/data/webdataset_instance/val/*.tar" \
+    --output_dir /nobackup/pmsanch1/experiments/segment_gh200_80epochs \
+    --batch_size 32 \
+    --epochs 80 \
+    --lr 6e-5 \
+    --num_workers 16 \
+    --prefetch_factor 8 \
+    --use_cca \
+    --center_weight 2.0 \
+    --offset_weight 1.0 \
+    --angle_weight 0.5 \
+    --center_sigma 2.0 \
+    --scheduler cosine --warmup_epochs 3 \
+    --plot_interval 5
+
+echo "================================================================="
+echo " Job finished at $(date) with exit code $?"
+echo "================================================================="

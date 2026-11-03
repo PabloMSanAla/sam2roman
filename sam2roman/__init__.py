@@ -10,10 +10,16 @@ from sam2roman.io.fits import FITSImage, stretch_astro_image
 from sam2roman.io.asdf_io import ASDFImage
 from sam2roman.io.reader import load_astro_image
 from sam2roman.models.sam2 import SAM2ModelWrapper
+from sam2roman.models.unetpp import UNetPlusPlus
+from sam2roman.models.unetpp_offset import UNetPlusPlusCenterOffset
 from sam2roman.inference.segmentor import SAM2Segmentor
+from sam2roman.inference.unetpp_segmentor import UNetPPSegmentor
+from sam2roman.inference.center_offset_segmentor import CenterOffsetSegmentor
 from sam2roman.training.dataset import AstronomicalDataset
 from sam2roman.training.losses import DiceLoss, CombinedSegmentationLoss
 from sam2roman.training.trainer import SAM2Trainer
+from sam2roman.training.unetpp_trainer import UNetPPTrainer
+from sam2roman.training.center_offset_trainer import CenterOffsetTrainer
 from sam2roman.visualization.stretch import leakySB, leakySB_inverse
 from sam2roman.visualization.display import (
     plot_masks_overlay,
@@ -29,11 +35,17 @@ __all__ = [
     "load_astro_image",
     "stretch_astro_image",
     "SAM2ModelWrapper",
+    "UNetPlusPlus",
+    "UNetPlusPlusCenterOffset",
     "SAM2Segmentor",
+    "UNetPPSegmentor",
+    "CenterOffsetSegmentor",
     "AstronomicalDataset",
     "DiceLoss",
     "CombinedSegmentationLoss",
     "SAM2Trainer",
+    "UNetPPTrainer",
+    "CenterOffsetTrainer",
     "leakySB",
     "leakySB_inverse",
     "plot_masks_overlay",
