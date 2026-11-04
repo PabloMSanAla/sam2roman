@@ -136,27 +136,37 @@ def compute_offset_epe(
     """
     Compute Endpoint Error (EPE) on foreground source pixels.
     EPE = mean(sqrt((dy - dy_gt)^2 + (dx - dx_gt)^2)).
+
+    Supports both single cutouts of shape (2, H, W) and batches of shape (B, 2, H, W).
     """
     if isinstance(pred_offset, torch.Tensor):
         po = pred_offset.detach().float().cpu().numpy()
         to = target_offset.detach().float().cpu().numpy()
         fg = fg_mask.detach().float().cpu().numpy()
     else:
-        po = np.asarray(pred_offset)
-        to = np.asarray(target_offset)
-        fg = np.asarray(fg_mask)
+        po = np.asarray(pred_offset, dtype=np.float32)
+        to = np.asarray(target_offset, dtype=np.float32)
+        fg = np.asarray(fg_mask, dtype=np.float32)
 
     if po.ndim == 4:
-        # Batch: squeeze or compute over batch
-        po = po.reshape(po.shape[0], 2, -1)
-        to = to.reshape(to.shape[0], 2, -1)
-        fg = (fg > 0).reshape(fg.shape[0], -1)
-        mask = fg
+        # Batch: (B, 2, H, W) -> Channel 0: dy, Channel 1: dx
+        dy_err = po[:, 0] - to[:, 0]
+        dx_err = po[:, 1] - to[:, 1]
+        if fg.ndim == 4 and fg.shape[1] == 1:
+            mask = fg[:, 0] > 0
+        else:
+            mask = fg > 0
+    elif po.ndim == 3:
+        # Single sample: (2, H, W)
+        dy_err = po[0] - to[0]
+        dx_err = po[1] - to[1]
+        if fg.ndim == 3 and fg.shape[0] == 1:
+            mask = fg[0] > 0
+        else:
+            mask = fg > 0
     else:
-        mask = (fg > 0).squeeze()
+        raise ValueError(f"Expected 3D (2, H, W) or 4D (B, 2, H, W) offsets, got shape {po.shape}")
 
-    dy_err = po[0] - to[0]
-    dx_err = po[1] - to[1]
     epe_map = np.sqrt(dy_err ** 2 + dx_err ** 2)
 
     if np.any(mask):

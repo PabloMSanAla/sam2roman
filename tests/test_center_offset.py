@@ -165,13 +165,20 @@ def test_metrics_evaluation():
     assert eval_res["f1"] == 1.0
     assert eval_res["mae"] == 0.0
 
-    # Offset EPE test
+    # Offset EPE test (3D single cutout)
     pred_o = np.ones((2, 64, 64), dtype=np.float32) * 5.0
     target_o = np.ones((2, 64, 64), dtype=np.float32) * 2.0
     fg = np.ones((64, 64), dtype=np.float32)
     epe = compute_offset_epe(pred_o, target_o, fg)
     # sqrt((5-2)^2 + (5-2)^2) = sqrt(9 + 9) = 3*sqrt(2) approx 4.2426
     assert np.isclose(epe, 3.0 * np.sqrt(2.0), atol=1e-3)
+
+    # Offset EPE test (4D batch with B=16)
+    pred_batch = np.ones((16, 2, 64, 64), dtype=np.float32) * 5.0
+    target_batch = np.ones((16, 2, 64, 64), dtype=np.float32) * 2.0
+    fg_batch = np.ones((16, 1, 64, 64), dtype=np.float32)
+    epe_batch = compute_offset_epe(pred_batch, target_batch, fg_batch)
+    assert np.isclose(epe_batch, 3.0 * np.sqrt(2.0), atol=1e-3)
 
 
 def test_inference_segmentor_mock():
