@@ -504,12 +504,13 @@ class CenterOffsetTrainer:
             val_loss = val_metrics.get("val_loss", train_metrics["loss"])
             f1 = val_metrics.get("center_f1", 0.0)
             epe = val_metrics.get("offset_epe", 0.0)
+            iou = val_metrics.get("fg_iou", 0.0)
 
             msg = (
                 f"Epoch {epoch:03d}/{epochs:03d} | Train Loss: {train_metrics['loss']:.4f} "
                 f"(sem: {train_metrics['sem_loss']:.3f}, ctr: {train_metrics['center_loss']:.3f}, "
                 f"off: {train_metrics['offset_loss']:.3f}, ang: {train_metrics['angle_loss']:.3f}) | "
-                f"Val Loss: {val_loss:.4f} | Center F1: {f1:.3f} | Offset EPE: {epe:.2f}px | "
+                f"Val Loss: {val_loss:.4f} | Fg IoU: {iou:.3f} | Center F1: {f1:.3f} | Offset EPE: {epe:.2f}px | "
                 f"LR: {current_lr:.2e} | {dt:.1f}s"
             )
             if verbose:
