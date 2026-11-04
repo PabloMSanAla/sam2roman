@@ -257,15 +257,16 @@ def plot_validation_examples(
             axes[i, 3].set_title("Pred Offset Vectors (Δy, Δx)")
             axes[i, 3].axis("off")
 
-            # Col 5: Reconstructed Instance Voting
-            segmentor = CenterOffsetSegmentor(model=model, device=device)
-            res = segmentor.segment_image(raw_arr, fg_thresh=0.5, center_thresh=0.3, verbose=False)
-            recon_map = np.zeros((h, w), dtype=np.int32)
-            for inst_idx, m in enumerate(res.masks):
-                recon_map[m] = inst_idx + 1
-
+            # Col 5: Reconstructed Instance Voting (direct vectorized deblending from predictions)
+            recon_map, masks, _, _, _, _ = CenterOffsetSegmentor.deblend_from_maps(
+                pred_semantic=p_fg,
+                pred_center=p_ctr,
+                pred_offsets=pred_off,
+                fg_thresh=0.5,
+                center_thresh=0.3,
+            )
             axes[i, 4].imshow(recon_map, cmap="gist_ncar", interpolation="nearest")
-            axes[i, 4].set_title(f"Deblended (N={len(res.masks)})")
+            axes[i, 4].set_title(f"Deblended (N={len(masks)})")
             axes[i, 4].axis("off")
 
     fig.suptitle(f"Grace Hopper Center Offset Validation (Epoch {epoch}/{epochs})", fontsize=16)
@@ -282,7 +283,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train_shards", type=str, nargs="+", required=True, help="Train WebDataset shard path pattern.")
     parser.add_argument("--val_shards", type=str, nargs="+", default=None, help="Val WebDataset shard path pattern.")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for checkpoints and curves.")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size per training step (default: 32).")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size per training step (default: 16).")
+    parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps (default: 1; use 2 with batch_size 16 for effective batch 32).")
     parser.add_argument("--epochs", type=int, default=80, help="Total training epochs (default: 80).")
     parser.add_argument("--lr", type=float, default=6e-5, help="Learning rate (default: 6e-5).")
     parser.add_argument("--weight_decay", type=float, default=1e-2, help="Weight decay (default: 1e-2).")
@@ -407,6 +409,7 @@ def main():
         val_dataset=val_shards,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        grad_accum_steps=args.grad_accum_steps,
         scheduler_type=args.scheduler_type,
         warmup_epochs=args.warmup_epochs,
         num_workers=args.num_workers,

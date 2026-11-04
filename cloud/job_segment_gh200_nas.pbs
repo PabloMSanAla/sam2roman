@@ -31,16 +31,33 @@ echo " Python Version: $($PYTHON_BIN --version 2>&1)"
 echo " Working directory: $(pwd)"
 echo "================================================================="
 
-# 2. Launch GH200 Center Offset Voting Training
+# 2. Optional: Stage dataset shards to local fast NVMe SSD ($TMPDIR) or RAM (/dev/shm)
+# For a 103 GB dataset on GH200 (480 GB unified RAM + NVMe SSD), staging eliminates
+# NFS/Lustre network latency and prevents GPU utilization drops.
+# DATA_DIR="/nobackup/pmsanch1/data/webdataset_instance"
+# if [ -d "$TMPDIR" ]; then
+#     echo "[I/O] Staging shards to node-local NVMe SSD: $TMPDIR/shards..."
+#     mkdir -p "$TMPDIR/shards"
+#     cp -r "$DATA_DIR"/* "$TMPDIR/shards/"
+#     TRAIN_SHARDS="$TMPDIR/shards/train/*.tar"
+#     VAL_SHARDS="$TMPDIR/shards/val/*.tar"
+# else
+TRAIN_SHARDS="/nobackup/pmsanch1/data/webdataset_instance/train/*.tar"
+VAL_SHARDS="/nobackup/pmsanch1/data/webdataset_instance/val/*.tar"
+# fi
+
+# 3. Launch GH200 Center Offset Voting Training
+# batch_size=16 (fits safely within ~28 GB VRAM); grad_accum_steps=2 yields effective batch size 32.
 $PYTHON_BIN /nobackup/pmsanch1/code/sam2roman/cloud/train_segment_gh200.py \
-    --train_shards "/nobackup/pmsanch1/data/webdataset_instance/train/*.tar" \
-    --val_shards "/nobackup/pmsanch1/data/webdataset_instance/val/*.tar" \
+    --train_shards "$TRAIN_SHARDS" \
+    --val_shards "$VAL_SHARDS" \
     --output_dir /nobackup/pmsanch1/experiments/segment_gh200_80epochs \
-    --batch_size 32 \
+    --batch_size 16 \
+    --grad_accum_steps 2 \
     --epochs 80 \
     --lr 6e-5 \
-    --num_workers 16 \
-    --prefetch_factor 8 \
+    --num_workers 27 \
+    --prefetch_factor 4 \
     --use_cca \
     --center_weight 2.0 \
     --offset_weight 1.0 \

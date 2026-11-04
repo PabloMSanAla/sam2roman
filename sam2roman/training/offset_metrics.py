@@ -83,7 +83,7 @@ def evaluate_center_detection(
     """
     if len(gt_centroids) == 0:
         fp = len(pred_peaks)
-        return {"precision": 0.0 if fp > 0 else 1.0, "recall": 1.0, "f1": 0.0, "mae": 0.0, "tp": 0, "fp": fp, "fn": 0}
+        return {"precision": 0.0 if fp > 0 else 1.0, "recall": 1.0, "f1": 0.0 if fp > 0 else 1.0, "mae": 0.0, "tp": 0, "fp": fp, "fn": 0}
     if len(pred_peaks) == 0:
         fn = len(gt_centroids)
         return {"precision": 1.0, "recall": 0.0, "f1": 0.0, "mae": 0.0, "tp": 0, "fp": 0, "fn": fn}

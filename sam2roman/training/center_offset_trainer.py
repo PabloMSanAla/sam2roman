@@ -33,7 +33,10 @@ from sam2roman.training.offset_metrics import (
     compute_offset_epe,
 )
 from sam2roman.training.gpu_transforms import GPUAstroTransform
-from sam2roman.training.webdataset_loader import create_webdataset_loader
+from sam2roman.training.webdataset_loader import (
+    create_webdataset_loader,
+    CenterOffsetBatchCollator,
+)
 
 logger = logging.getLogger("sam2roman.center_offset_trainer")
 
@@ -196,7 +199,7 @@ class CenterOffsetTrainer:
         )
         return fg_t, c_t, o_t
 
-    def train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
+    def train_epoch(self, dataloader: DataLoader, grad_accum_steps: int = 1) -> Dict[str, float]:
         """Execute one complete training epoch."""
         self.model.train()
         if self.gpu_transform is not None:
@@ -208,8 +211,9 @@ class CenterOffsetTrainer:
         total_offset = 0.0
         total_ang = 0.0
         steps = 0
+        self.optimizer.zero_grad()
 
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
             if "image" in batch:
                 images = batch["image"].to(self.device, non_blocking=True)
             elif "raw" in batch:
@@ -224,42 +228,58 @@ class CenterOffsetTrainer:
 
             fg_t, c_t, o_t = self._prepare_targets(batch)
 
-            self.optimizer.zero_grad()
-
             if self.use_amp:
                 with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
                     preds = self.model(images)
                     loss_dict = self.criterion(preds, fg_t, c_t, o_t)
-                    loss = loss_dict["loss"]
+                    loss = loss_dict["loss"] / grad_accum_steps
             else:
                 preds = self.model(images)
                 loss_dict = self.criterion(preds, fg_t, c_t, o_t)
-                loss = loss_dict["loss"]
+                loss = loss_dict["loss"] / grad_accum_steps
 
             if not torch.isfinite(loss):
-                logger.warning(f"Non-finite loss ({loss.item()}) at step {steps}. Skipping backward.")
+                logger.warning(f"Non-finite loss ({loss.item() * grad_accum_steps}) at step {steps}. Skipping backward.")
                 self.optimizer.zero_grad()
                 continue
 
             if self.scaler.is_enabled():
                 self.scaler.scale(loss).backward()
+                if (batch_idx + 1) % grad_accum_steps == 0:
+                    if self.grad_clip_norm > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
+            else:
+                loss.backward()
+                if (batch_idx + 1) % grad_accum_steps == 0:
+                    if self.grad_clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip_norm)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
+            total_loss += loss.item() * grad_accum_steps
+            total_sem += loss_dict["sem_loss"].item()
+            total_center += loss_dict["center_loss"].item()
+            total_offset += loss_dict["offset_loss"].item()
+            total_ang += loss_dict["angle_loss"].item()
+            steps += 1
+
+        # Final gradient update for remainder batches
+        if steps > 0 and (steps % grad_accum_steps) != 0:
+            if self.scaler.is_enabled():
                 if self.grad_clip_norm > 0:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip_norm)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                loss.backward()
                 if self.grad_clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip_norm)
                 self.optimizer.step()
-
-            total_loss += loss.item()
-            total_sem += loss_dict["sem_loss"].item()
-            total_center += loss_dict["center_loss"].item()
-            total_offset += loss_dict["offset_loss"].item()
-            total_ang += loss_dict["angle_loss"].item()
-            steps += 1
+            self.optimizer.zero_grad()
 
         n = max(1, steps)
         return {
@@ -354,6 +374,7 @@ class CenterOffsetTrainer:
         val_dataset: Optional[Any] = None,
         epochs: int = 50,
         batch_size: int = 32,
+        grad_accum_steps: int = 1,
         scheduler_type: str = "cosine",
         warmup_epochs: int = 3,
         num_workers: int = 16,
@@ -366,6 +387,8 @@ class CenterOffsetTrainer:
         """
         Execute full multi-epoch training run.
         """
+        collator = CenterOffsetBatchCollator(sigma=self.center_sigma)
+
         # Build DataLoaders
         if _is_webdataset_shards(dataset):
             train_loader = create_webdataset_loader(
@@ -375,6 +398,7 @@ class CenterOffsetTrainer:
                 num_workers=num_workers,
                 prefetch_factor=prefetch_factor,
                 persistent_workers=True if num_workers > 0 else False,
+                collate_fn=collator,
             )
         elif isinstance(dataset, DataLoader):
             train_loader = dataset
@@ -397,6 +421,7 @@ class CenterOffsetTrainer:
                     num_workers=max(1, num_workers // 2),
                     prefetch_factor=prefetch_factor,
                     persistent_workers=True if num_workers > 0 else False,
+                    collate_fn=collator,
                 )
             elif isinstance(val_dataset, DataLoader):
                 val_loader = val_dataset
@@ -447,7 +472,7 @@ class CenterOffsetTrainer:
 
         for epoch in range(1, epochs + 1):
             t0 = time.time()
-            train_metrics = self.train_epoch(train_loader)
+            train_metrics = self.train_epoch(train_loader, grad_accum_steps=grad_accum_steps)
 
             val_metrics: Dict[str, float] = {}
             if val_loader is not None:
@@ -514,6 +539,7 @@ class CenterOffsetTrainer:
                     {
                         "epoch": epoch,
                         "model_state_dict": self.model.state_dict(),
+                        "optimizer_state_dict": self.optimizer.state_dict(),
                         "val_loss": val_loss,
                         "in_channels": self.in_channels,
                         "semantic_classes": self.semantic_classes,

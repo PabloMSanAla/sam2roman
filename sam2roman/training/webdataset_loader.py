@@ -75,6 +75,51 @@ def collate_webdataset_batch(batch: List[Sequence[Any]]) -> Dict[str, Any]:
     }
 
 
+class CenterOffsetBatchCollator:
+    """
+    DataLoader collation class that computes (fg, center, offset) targets
+    asynchronously inside the DataLoader CPU worker processes.
+
+    Parameters
+    ----------
+    sigma : float, default 2.0
+        Standard deviation for Gaussian center peaks in pixels.
+    adaptive_sigma : bool, default False
+        Adaptive Gaussian radius based on area.
+    min_area : int, default 1
+        Minimum pixel count per source.
+    """
+
+    def __init__(
+        self,
+        sigma: float = 2.0,
+        adaptive_sigma: bool = False,
+        min_area: int = 1,
+    ):
+        self.sigma = float(sigma)
+        self.adaptive_sigma = bool(adaptive_sigma)
+        self.min_area = int(min_area)
+
+    def __call__(self, batch: List[Sequence[Any]]) -> Dict[str, Any]:
+        collated = collate_webdataset_batch(batch)
+        if "fg" in collated and "center" in collated and "offset" in collated:
+            return collated
+
+        from sam2roman.training.offset_target import generate_center_offset_batch
+
+        fg_t, c_t, o_t = generate_center_offset_batch(
+            collated["target"],
+            sigma=self.sigma,
+            min_area=self.min_area,
+            adaptive_sigma=self.adaptive_sigma,
+            device=None,
+        )
+        collated["fg"] = fg_t
+        collated["center"] = c_t
+        collated["offset"] = o_t
+        return collated
+
+
 def resolve_shard_urls(urls: Union[str, Path, Sequence[Union[str, Path]]]) -> List[str]:
     """
     Expand directory paths, glob patterns, or URL lists into valid WebDataset shard strings.
@@ -120,6 +165,7 @@ def create_webdataset_loader(
     drop_last: bool = True,
     prefetch_factor: Optional[int] = None,
     persistent_workers: Optional[bool] = None,
+    collate_fn: Optional[Any] = None,
 ) -> DataLoader:
     """
     Build a high-performance streaming DataLoader over WebDataset shards.
@@ -178,7 +224,7 @@ def create_webdataset_loader(
 
     loader_kwargs: Dict[str, Any] = {
         "batch_size": batch_size,
-        "collate_fn": collate_webdataset_batch,
+        "collate_fn": collate_fn if collate_fn is not None else collate_webdataset_batch,
         "num_workers": effective_workers,
         "pin_memory": pin_memory,
         "drop_last": drop_last if is_train else False,

@@ -112,6 +112,127 @@ class CenterOffsetSegmentor:
     ) -> "CenterOffsetSegmentor":
         return cls(checkpoint_path=checkpoint_path, device=device)
 
+    @staticmethod
+    def deblend_from_maps(
+        pred_semantic: np.ndarray,
+        pred_center: np.ndarray,
+        pred_offsets: np.ndarray,
+        fg_thresh: float = 0.50,
+        center_thresh: float = 0.30,
+        min_distance: int = 3,
+        colinear_thresh: float = 0.70,
+        max_vote_dist: float = 64.0,
+        min_area: int = 4,
+        max_area: Optional[int] = None,
+    ) -> Tuple[np.ndarray, List[np.ndarray], List[List[float]], List[float], List[Tuple[float, float]]]:
+        """
+        Deblend instances directly from predicted semantic, center, and offset maps.
+
+        Parameters
+        ----------
+        pred_semantic : np.ndarray
+            Foreground probability array of shape (H, W).
+        pred_center : np.ndarray
+            Center keypoint heatmap of shape (H, W).
+        pred_offsets : np.ndarray
+            Offset vector field of shape (2, H, W) where [0] is dy and [1] is dx.
+        fg_thresh : float, default 0.50
+        center_thresh : float, default 0.30
+        min_distance : int, default 3
+        colinear_thresh : float, default 0.70
+        max_vote_dist : float, default 64.0
+        min_area : int, default 4
+        max_area : int, optional
+
+        Returns
+        -------
+        Tuple containing:
+            - labeled_map: (H, W) integer map of instance IDs (0: bg, 1..N: instances)
+            - masks: List of boolean masks
+            - boxes: List of [xmin, ymin, xmax, ymax]
+            - scores: List of mean foreground scores
+            - centroids: List of (cx, cy)
+        """
+        p_fg = pred_semantic.squeeze()
+        p_ctr = pred_center.squeeze()
+        h, w = p_fg.shape
+
+        # 1. Extract candidate centers via peak NMS
+        peaks = extract_center_peaks(p_ctr, threshold=center_thresh, min_distance=min_distance)
+
+        # 2. Foreground mask
+        fg_mask = (p_fg >= fg_thresh)
+        labeled_map = np.zeros((h, w), dtype=np.int32)
+
+        if len(peaks) > 0 and np.any(fg_mask):
+            centers = np.array([[p[0], p[1]] for p in peaks], dtype=np.float32)  # (K, 2): [cy, cx]
+            fg_ys, fg_xs = np.where(fg_mask)
+            dy_pred = pred_offsets[0, fg_ys, fg_xs]
+            dx_pred = pred_offsets[1, fg_ys, fg_xs]
+
+            # Shifted destination points (y*, x*)
+            dest_ys = fg_ys + dy_pred
+            dest_xs = fg_xs + dx_pred
+
+            # Distance matrix between destination points and center peaks
+            dists = np.sqrt(
+                (dest_ys[:, None] - centers[None, :, 0]) ** 2
+                + (dest_xs[:, None] - centers[None, :, 1]) ** 2
+            )
+
+            # Colinear angular check for distant points
+            vec_to_centers_y = centers[None, :, 0] - fg_ys[:, None]
+            vec_to_centers_x = centers[None, :, 1] - fg_xs[:, None]
+            norm_c = np.sqrt(vec_to_centers_y ** 2 + vec_to_centers_x ** 2) + 1e-6
+            norm_p = np.sqrt(dy_pred ** 2 + dx_pred ** 2)[:, None] + 1e-6
+
+            cos_angles = (dy_pred[:, None] * vec_to_centers_y + dx_pred[:, None] * vec_to_centers_x) / (norm_p * norm_c)
+
+            is_distant = (norm_c > 10.0)
+            misaligned = is_distant & (cos_angles < colinear_thresh)
+            dists[misaligned] += 1000.0
+
+            best_center_indices = np.argmin(dists, axis=1)
+            min_dists = dists[np.arange(len(fg_ys)), best_center_indices]
+
+            valid_assignment = min_dists <= max_vote_dist
+            assigned_labels = best_center_indices[valid_assignment] + 1
+            labeled_map[fg_ys[valid_assignment], fg_xs[valid_assignment]] = assigned_labels
+
+        # 3. Extract individual instance masks & properties
+        masks_list: List[np.ndarray] = []
+        boxes_list: List[List[float]] = []
+        scores_list: List[float] = []
+        areas_list: List[int] = []
+        centroids_list: List[Tuple[float, float]] = []
+
+        unique_instances = np.unique(labeled_map)
+        unique_instances = unique_instances[unique_instances > 0]
+
+        for obj_id in unique_instances:
+            m = (labeled_map == obj_id)
+            area = int(np.sum(m))
+            if area < min_area or (max_area is not None and area > max_area):
+                continue
+
+            ys, xs = np.where(m)
+            cx = float(np.mean(xs))
+            cy = float(np.mean(ys))
+            score = float(np.mean(p_fg[m]))
+
+            x_min = float(np.min(xs))
+            x_max = float(np.max(xs))
+            y_min = float(np.min(ys))
+            y_max = float(np.max(ys))
+
+            masks_list.append(m)
+            boxes_list.append([x_min, y_min, x_max, y_max])
+            scores_list.append(score)
+            areas_list.append(area)
+            centroids_list.append((cx, cy))
+
+        return labeled_map, masks_list, boxes_list, scores_list, areas_list, centroids_list
+
     def segment_image(
         self,
         image: Union[FITSImage, ASDFImage, np.ndarray, str, Path],
@@ -191,88 +312,23 @@ class CenterOffsetSegmentor:
             pred_offsets = preds["offset"][0].float().cpu().numpy()  # (2, H, W)
         fwd_time = time.time() - t_fwd
 
-        # 1. Extract candidate centers via peak NMS
-        peaks = extract_center_peaks(p_ctr, threshold=center_thresh, min_distance=min_distance)
+        # Deblend instances from predictions
+        labeled_map, masks_list, boxes_list, scores_list, areas_list, centroids_list = self.deblend_from_maps(
+            pred_semantic=p_fg,
+            pred_center=p_ctr,
+            pred_offsets=pred_offsets,
+            fg_thresh=fg_thresh,
+            center_thresh=center_thresh,
+            min_distance=min_distance,
+            colinear_thresh=colinear_thresh,
+            max_vote_dist=max_vote_dist,
+            min_area=min_area,
+            max_area=max_area,
+        )
 
-        # 2. Foreground mask
-        fg_mask = (p_fg >= fg_thresh)
-        labeled_map = np.zeros((h, w), dtype=np.int32)
-
-        if len(peaks) > 0 and np.any(fg_mask):
-            centers = np.array([[p[0], p[1]] for p in peaks], dtype=np.float32)  # (K, 2): [cy, cx]
-            k_centers = len(centers)
-
-            fg_ys, fg_xs = np.where(fg_mask)
-            dy_pred = pred_offsets[0, fg_ys, fg_xs]
-            dx_pred = pred_offsets[1, fg_ys, fg_xs]
-
-            # Shifted destination points (y*, x*)
-            dest_ys = fg_ys + dy_pred
-            dest_xs = fg_xs + dx_pred
-
-            # Vectorized assignment to nearest center
-            # Compute distance matrix between (N_fg, 2) and (K, 2)
-            dists = np.sqrt(
-                (dest_ys[:, None] - centers[None, :, 0]) ** 2
-                + (dest_xs[:, None] - centers[None, :, 1]) ** 2
-            )  # (N_fg, K)
-
-            # Colinear angular check for distant points (> 8 px from core)
-            vec_to_centers_y = centers[None, :, 0] - fg_ys[:, None]
-            vec_to_centers_x = centers[None, :, 1] - fg_xs[:, None]
-            norm_c = np.sqrt(vec_to_centers_y ** 2 + vec_to_centers_x ** 2) + 1e-6
-            norm_p = np.sqrt(dy_pred ** 2 + dx_pred ** 2)[:, None] + 1e-6
-
-            cos_angles = (dy_pred[:, None] * vec_to_centers_y + dx_pred[:, None] * vec_to_centers_x) / (norm_p * norm_c)
-
-            # Penalize distance for misaligned candidate centers on distant spike wings
-            is_distant = (norm_c > 10.0)
-            misaligned = is_distant & (cos_angles < colinear_thresh)
-            dists[misaligned] += 1000.0
-
-            best_center_indices = np.argmin(dists, axis=1)
-            min_dists = dists[np.arange(len(fg_ys)), best_center_indices]
-
-            # Assign valid foreground pixels to winning instance ID (1-indexed)
-            valid_assignment = min_dists <= max_vote_dist
-            assigned_labels = best_center_indices[valid_assignment] + 1
-            labeled_map[fg_ys[valid_assignment], fg_xs[valid_assignment]] = assigned_labels
-
-        # 3. Extract individual instance masks & properties
-        masks_list: List[np.ndarray] = []
-        boxes_list: List[List[float]] = []
-        scores_list: List[float] = []
-        areas_list: List[int] = []
-        centroids_list: List[Tuple[float, float]] = []
         sky_centroids: Optional[List[Tuple[float, float]]] = [] if astro_obj and astro_obj.wcs else None
-
-        unique_instances = np.unique(labeled_map)
-        unique_instances = unique_instances[unique_instances > 0]
-
-        for obj_id in unique_instances:
-            m = (labeled_map == obj_id)
-            area = int(np.sum(m))
-            if area < min_area or (max_area is not None and area > max_area):
-                continue
-
-            ys, xs = np.where(m)
-            cx = float(np.mean(xs))
-            cy = float(np.mean(ys))
-
-            score = float(np.mean(p_fg[m]))
-
-            x_min = float(np.min(xs))
-            x_max = float(np.max(xs))
-            y_min = float(np.min(ys))
-            y_max = float(np.max(ys))
-
-            masks_list.append(m)
-            boxes_list.append([x_min, y_min, x_max, y_max])
-            scores_list.append(score)
-            areas_list.append(area)
-            centroids_list.append((cx, cy))
-
-            if sky_centroids is not None and astro_obj is not None:
+        if sky_centroids is not None and astro_obj is not None:
+            for cx, cy in centroids_list:
                 sky_pt = astro_obj.pixel_to_sky(cx, cy)
                 if sky_pt:
                     sky_centroids.append(sky_pt)

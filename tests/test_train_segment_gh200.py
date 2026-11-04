@@ -99,7 +99,60 @@ def test_center_offset_trainer_run(tmp_path):
     assert (tmp_path / "epoch_log.txt").exists()
     assert (tmp_path / "center_offset_latest.pt").exists()
     assert (tmp_path / "center_offset_best.pt").exists()
+    best_ckpt = torch.load(tmp_path / "center_offset_best.pt", weights_only=False)
+    assert "optimizer_state_dict" in best_ckpt
     assert (tmp_path / "training_metrics.json").exists()
+
+
+def test_center_offset_batch_collator():
+    """Verify CenterOffsetBatchCollator precomputes fg, center, and offset asynchronously."""
+    from sam2roman.training.webdataset_loader import CenterOffsetBatchCollator
+
+    collator = CenterOffsetBatchCollator(sigma=2.0)
+    raw_1 = np.ones((64, 64), dtype=np.float32)
+    tgt_1 = np.zeros((64, 64), dtype=np.int32)
+    tgt_1[20:30, 20:30] = 1
+
+    batch_input = [
+        (raw_1, tgt_1, {"id": 1}),
+        (raw_1 * 2, tgt_1 * 2, {"id": 2}),
+    ]
+    collated = collator(batch_input)
+
+    assert "raw" in collated
+    assert "target" in collated
+    assert "fg" in collated
+    assert "center" in collated
+    assert "offset" in collated
+    assert collated["fg"].shape == (2, 1, 64, 64)
+    assert collated["center"].shape == (2, 1, 64, 64)
+    assert collated["offset"].shape == (2, 2, 64, 64)
+
+
+def test_grad_accum_steps(tmp_path):
+    """Verify training with gradient accumulation steps."""
+    ds = DummyInstanceDataset(n_samples=4)
+    loader = DataLoader(ds, batch_size=2)
+
+    trainer = CenterOffsetTrainer(
+        in_channels=1,
+        features=(8, 16, 32, 64, 128),
+        use_cca=False,
+        learning_rate=1e-3,
+        gpu_transform=None,
+        device="cpu",
+    )
+
+    history = trainer.train(
+        dataset=loader,
+        val_dataset=loader,
+        epochs=1,
+        batch_size=2,
+        grad_accum_steps=2,
+        output_dir=tmp_path / "grad_accum",
+        verbose=False,
+    )
+    assert len(history["loss"]) == 1
 
 
 def test_plot_curves_and_validation(tmp_path):
