@@ -186,9 +186,9 @@ class CenterOffsetSegmentor:
         t_fwd = time.time()
         with torch.no_grad():
             preds = self.model(input_tensor)
-            p_fg = torch.sigmoid(preds["semantic"][0, 0]).cpu().numpy()
-            p_ctr = torch.sigmoid(preds["center"][0, 0]).cpu().numpy()
-            pred_offsets = preds["offset"][0].cpu().numpy()  # (2, H, W)
+            p_fg = torch.sigmoid(preds["semantic"][0, 0]).float().cpu().numpy()
+            p_ctr = torch.sigmoid(preds["center"][0, 0]).float().cpu().numpy()
+            pred_offsets = preds["offset"][0].float().cpu().numpy()  # (2, H, W)
         fwd_time = time.time() - t_fwd
 
         # 1. Extract candidate centers via peak NMS

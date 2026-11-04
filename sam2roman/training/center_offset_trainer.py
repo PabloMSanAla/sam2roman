@@ -321,11 +321,11 @@ class CenterOffsetTrainer:
                 total_epe += epe
 
                 # Compute Center Peak F1 on first item of batch for speed
-                pred_c_prob = torch.sigmoid(preds["center"][0, 0]).cpu().numpy()
+                pred_c_prob = torch.sigmoid(preds["center"][0, 0]).float().cpu().numpy()
                 peaks = extract_center_peaks(pred_c_prob, threshold=0.3, min_distance=3)
 
                 # Extract ground truth centroids from target mask
-                gt_mask_0 = batch["target"][0].cpu().numpy()
+                gt_mask_0 = batch["target"][0].detach().cpu().numpy()
                 gt_ids = np.unique(gt_mask_0)
                 gt_ids = gt_ids[gt_ids > 0]
                 gt_centroids = []

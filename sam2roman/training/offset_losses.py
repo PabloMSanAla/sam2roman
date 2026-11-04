@@ -33,17 +33,26 @@ class CenterFocalLoss(nn.Module):
         Gaussian penalty reduction parameter softening loss around peak neighbors.
     eps : float, default 1e-6
         Numerical epsilon clamping log probabilities.
+    logit_clamp : float, default 15.0
+        Maximum absolute logit threshold to prevent float underflow/overflow.
     """
 
-    def __init__(self, alpha: float = 2.0, beta: float = 4.0, eps: float = 1e-6):
+    def __init__(
+        self,
+        alpha: float = 2.0,
+        beta: float = 4.0,
+        eps: float = 1e-6,
+        logit_clamp: float = 15.0,
+    ):
         super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.eps = eps
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.eps = float(eps)
+        self.logit_clamp = float(logit_clamp)
 
     def forward(self, pred_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
-        Compute focal loss on Gaussian center heatmaps.
+        Compute focal loss on Gaussian center heatmaps in float32.
 
         Parameters
         ----------
@@ -57,8 +66,13 @@ class CenterFocalLoss(nn.Module):
         torch.Tensor:
             Scalar loss.
         """
-        pred = torch.sigmoid(pred_logits).clamp(self.eps, 1.0 - self.eps)
-        targets = targets.clamp(0.0, 1.0)
+        # Always compute focal log-likelihoods in float32 to prevent bfloat16 underflow
+        logits = pred_logits.float()
+        targets = targets.float().clamp(0.0, 1.0)
+
+        # Clamping logits prevents exp() / sigmoid() saturation to exact 1.0 or 0.0
+        logits = torch.clamp(logits, -self.logit_clamp, self.logit_clamp)
+        pred = torch.sigmoid(logits).clamp(self.eps, 1.0 - self.eps)
 
         pos_mask = targets.eq(1.0)
         neg_mask = targets.lt(1.0)
@@ -77,9 +91,10 @@ class CenterFocalLoss(nn.Module):
         if num_pos > 0:
             loss = -(pos_term + neg_term) / num_pos
         else:
-            loss = -neg_term
+            # If no center peaks in the batch, normalize by batch size
+            loss = -neg_term / max(1.0, float(targets.shape[0]))
 
-        return loss
+        return torch.nan_to_num(loss, nan=0.0, posinf=50.0, neginf=0.0)
 
 
 class MaskedSmoothL1Loss(nn.Module):
@@ -94,7 +109,7 @@ class MaskedSmoothL1Loss(nn.Module):
 
     def __init__(self, beta: float = 1.0):
         super().__init__()
-        self.beta = beta
+        self.beta = float(beta)
 
     def forward(
         self,
@@ -117,11 +132,14 @@ class MaskedSmoothL1Loss(nn.Module):
         torch.Tensor:
             Scalar offset regression loss.
         """
+        pred_offsets = pred_offsets.float()
+        target_offsets = target_offsets.float()
+        fg_mask = fg_mask.float()
         if fg_mask.ndim == 3:
             fg_mask = fg_mask.unsqueeze(1)
 
         diff = F.smooth_l1_loss(pred_offsets, target_offsets, reduction="none", beta=self.beta)
-        fg_expanded = fg_mask.float().expand_as(diff)
+        fg_expanded = fg_mask.expand_as(diff)
 
         num_fg_elements = fg_expanded.sum()
         if num_fg_elements > 0:
@@ -129,7 +147,7 @@ class MaskedSmoothL1Loss(nn.Module):
         else:
             loss = pred_offsets.new_tensor(0.0)
 
-        return loss
+        return torch.nan_to_num(loss, nan=0.0, posinf=100.0, neginf=0.0)
 
 
 class AngularCosineDistanceLoss(nn.Module):
@@ -148,8 +166,8 @@ class AngularCosineDistanceLoss(nn.Module):
 
     def __init__(self, eps: float = 1e-6, min_norm: float = 1.0):
         super().__init__()
-        self.eps = eps
-        self.min_norm = min_norm
+        self.eps = float(eps)
+        self.min_norm = float(min_norm)
 
     def forward(
         self,
@@ -172,6 +190,9 @@ class AngularCosineDistanceLoss(nn.Module):
         torch.Tensor:
             Scalar angular loss.
         """
+        pred_offsets = pred_offsets.float()
+        target_offsets = target_offsets.float()
+        fg_mask = fg_mask.float()
         if fg_mask.ndim == 3:
             fg_mask = fg_mask.unsqueeze(1)
 
@@ -184,7 +205,7 @@ class AngularCosineDistanceLoss(nn.Module):
         norm_pred = torch.sqrt(pred_dy ** 2 + pred_dx ** 2 + self.eps)
         norm_tgt = torch.sqrt(tgt_dy ** 2 + tgt_dx ** 2 + self.eps)
 
-        cos_sim = dot / (norm_pred * norm_tgt)
+        cos_sim = dot / (norm_pred * norm_tgt + self.eps)
         ang_dist = 1.0 - torch.clamp(cos_sim, -1.0, 1.0)
 
         # Apply constraint only on foreground pixels beyond minimum distance from center
@@ -196,7 +217,7 @@ class AngularCosineDistanceLoss(nn.Module):
         else:
             loss = pred_offsets.new_tensor(0.0)
 
-        return loss
+        return torch.nan_to_num(loss, nan=0.0, posinf=2.0, neginf=0.0)
 
 
 class CenterOffsetCompositeLoss(nn.Module):
@@ -267,9 +288,12 @@ class CenterOffsetCompositeLoss(nn.Module):
             Dictionary containing 'loss' (scalar total) and individual terms:
             'sem_loss', 'center_loss', 'offset_loss', 'angle_loss'.
         """
-        sem_pred = predictions["semantic"]
-        center_pred = predictions["center"]
-        offset_pred = predictions["offset"]
+        sem_pred = predictions["semantic"].float()
+        center_pred = predictions["center"].float()
+        offset_pred = predictions["offset"].float()
+        fg_target = fg_target.float()
+        center_target = center_target.float()
+        offset_target = offset_target.float()
 
         if fg_target.ndim == 3:
             fg_target = fg_target.unsqueeze(1)
@@ -297,6 +321,7 @@ class CenterOffsetCompositeLoss(nn.Module):
             + self.offset_weight * l_offset
             + self.angle_weight * l_ang
         )
+        total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=100.0, neginf=0.0)
 
         return {
             "loss": total_loss,

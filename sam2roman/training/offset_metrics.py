@@ -39,7 +39,7 @@ def extract_center_peaks(
         List of (cy, cx, score) for each detected peak.
     """
     if isinstance(center_prob, torch.Tensor):
-        c_np = center_prob.detach().cpu().numpy()
+        c_np = center_prob.detach().float().cpu().numpy()
     else:
         c_np = np.asarray(center_prob, dtype=np.float32)
 
@@ -138,9 +138,9 @@ def compute_offset_epe(
     EPE = mean(sqrt((dy - dy_gt)^2 + (dx - dx_gt)^2)).
     """
     if isinstance(pred_offset, torch.Tensor):
-        po = pred_offset.detach().cpu().numpy()
-        to = target_offset.detach().cpu().numpy()
-        fg = fg_mask.detach().cpu().numpy()
+        po = pred_offset.detach().float().cpu().numpy()
+        to = target_offset.detach().float().cpu().numpy()
+        fg = fg_mask.detach().float().cpu().numpy()
     else:
         po = np.asarray(pred_offset)
         to = np.asarray(target_offset)

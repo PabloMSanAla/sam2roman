@@ -212,12 +212,12 @@ def plot_validation_examples(
             else:
                 preds = model(img_t)
 
-            p_fg = torch.sigmoid(preds["semantic"][0, 0]).cpu().numpy()
-            p_ctr = torch.sigmoid(preds["center"][0, 0]).cpu().numpy()
-            pred_off = preds["offset"][0].cpu().numpy()
+            p_fg = torch.sigmoid(preds["semantic"][0, 0]).float().cpu().numpy()
+            p_ctr = torch.sigmoid(preds["center"][0, 0]).float().cpu().numpy()
+            pred_off = preds["offset"][0].float().cpu().numpy()
 
             # RGB / 2D for visualization
-            vis_arr = img_t[0].permute(1, 2, 0).cpu().numpy().clip(0.0, 1.0)
+            vis_arr = img_t[0].permute(1, 2, 0).float().cpu().numpy().clip(0.0, 1.0)
             if vis_arr.shape[-1] == 1:
                 vis_arr = vis_arr.squeeze(-1)
 

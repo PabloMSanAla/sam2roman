@@ -67,3 +67,8 @@ Thumbs.db
 # IDEs
 .vscode/
 .idea/
+
+# Reports & Documentation artifacts
+REPORT_UNETPP_AND_SEGMENT.md
+reports/
+
