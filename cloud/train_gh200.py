@@ -488,6 +488,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable GPU astronomical noise injection (Poisson shot + Gaussian read noise).",
     )
     parser.add_argument(
+        "--rot_prob",
+        type=float,
+        default=0.0,
+        help="Probability of random 90-degree rotations in GPU augmentation (default: 0.0, disabled).",
+    )
+    parser.add_argument(
         "--soft_boundary",
         action="store_true",
         default=False,
@@ -580,6 +586,7 @@ def main():
         aug_kwargs={
             "enable_noise": args.noise_aug,
             "enable_spatial": True,
+            "rot_prob": args.rot_prob,
             "shot_noise_prob": 0.5,
             "read_noise_prob": 0.5,
             "sky_pedestal_prob": 0.5,

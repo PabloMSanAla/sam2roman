@@ -245,8 +245,8 @@ class GPUAstroAugmentation(nn.Module):
         Uniform random flux scaling range (zeropoint jitter).
     flux_scale_prob : float, default 0.5
         Probability of scaling flux.
-    rot_prob : float, default 0.5
-        Probability of applying random 90-degree rotations.
+    rot_prob : float, default 0.0
+        Probability of applying random 90-degree rotations (default 0.0, disabled).
     flip_h_prob : float, default 0.5
         Probability of horizontal reflection.
     flip_v_prob : float, default 0.5
@@ -271,7 +271,7 @@ class GPUAstroAugmentation(nn.Module):
         gradient_sigma_range: Tuple[float, float] = (2.0, 25.0),
         flux_scale_range: Tuple[float, float] = (0.9, 1.1),
         flux_scale_prob: float = 0.5,
-        rot_prob: float = 0.5,
+        rot_prob: float = 0.0,
         flip_h_prob: float = 0.5,
         flip_v_prob: float = 0.5,
     ):

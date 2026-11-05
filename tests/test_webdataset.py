@@ -175,6 +175,28 @@ def test_gpu_astro_augmentation():
     assert torch.allclose(eval_target, target)
 
 
+def test_gpu_astro_augmentation_default_rotation_disabled():
+    """Verify that rotation is disabled by default in GPU noise augmentation."""
+    aug = GPUAstroAugmentation(
+        enable_noise=True,
+        enable_spatial=True,
+        flip_h_prob=0.0,
+        flip_v_prob=0.0,
+    )
+    assert aug.rot_prob == 0.0
+    aug.train()
+
+    # Create an asymmetric pattern
+    raw = torch.zeros((1, 1, 8, 8), dtype=torch.float32)
+    raw[0, 0, 0, 1] = 1000.0  # specific asymmetric pixel
+    target = torch.zeros((1, 8, 8), dtype=torch.int64)
+    target[0, 0, 1] = 1
+
+    aug_raw, aug_target = aug(raw, target)
+    # The coordinate of the bright pixel must not be rotated
+    assert aug_target[0, 0, 1] == 1
+
+
 def test_measure_background_noise():
     """Verify GPU-accelerated background noise and pedestal measurement."""
     torch.manual_seed(42)

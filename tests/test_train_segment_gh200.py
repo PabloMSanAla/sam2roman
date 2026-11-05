@@ -71,6 +71,7 @@ def test_cli_parser():
     assert args.center_weight == 2.5
     assert args.gate_weight == 1.2
     assert args.inst_weight == 1.5
+    assert args.rot_prob == 0.0
 
 
 def test_steer_query_trainer_run(tmp_path):

@@ -313,6 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proto_dim", type=int, default=32, help="Prototype feature dimension D (default: 32).")
     parser.add_argument("--n_max", type=int, default=128, help="Maximum number of queries N_max (default: 128).")
     parser.add_argument("--noise_aug", action="store_true", default=True, help="Enable GPU Poisson shot & Gaussian read noise.")
+    parser.add_argument("--rot_prob", type=float, default=0.0, help="Probability of random 90-degree rotations in GPU augmentation (default: 0.0, disabled).")
     parser.add_argument("--mmin_jitter", type=float, default=1.5, help="Magnitude jitter for mmin in LeakySB (default: 1.5 mag).")
     parser.add_argument("--mmax_jitter", type=float, default=1.5, help="Magnitude jitter for mmax in LeakySB (default: 1.5 mag).")
     parser.add_argument("--gradient_prob", type=float, default=0.5, help="Probability of applying tilted-plane background gradient (default: 0.5).")
@@ -375,6 +376,7 @@ def main():
         aug_kwargs={
             "enable_noise": args.noise_aug,
             "enable_spatial": False,
+            "rot_prob": args.rot_prob,
             "auto_scale_noise": True,
             "gain": 100.0,
             "gradient_prob": args.gradient_prob if args.noise_aug else 0.0,
