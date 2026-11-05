@@ -1,6 +1,6 @@
 #PBS -S /bin/bash
 #PBS -N sam2roman_gh200
-#PBS -l select=1:ncpus=72:mpiprocs=1:model=gh200
+#PBS -l select=1:ncpus=72:mpiprocs=1:model=gh200:mem=400gb
 #PBS -l walltime=04:00:00
 #PBS -q gpu_normal
 #PBS -j oe
