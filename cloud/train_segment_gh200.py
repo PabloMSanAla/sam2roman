@@ -328,8 +328,10 @@ def main():
         aug_kwargs={
             "enable_noise": args.noise_aug,
             "enable_spatial": False,
+            "auto_scale_noise": True,
+            "gain": 100.0,
             "gradient_prob": args.gradient_prob if args.noise_aug else 0.0,
-            "gradient_sigma_range": (0.5, args.gradient_sigma_max),
+            "gradient_scale_range": (0.2, 2.5),
         },
     ).to(device)
 

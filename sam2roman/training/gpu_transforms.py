@@ -153,10 +153,62 @@ class GPULeakySB(nn.Module):
         return stretched
 
 
+def measure_background_noise(
+    raw: torch.Tensor,
+    target: Optional[torch.Tensor] = None,
+    gain: float = 100.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Measure background pedestal (median) and noise dispersion (RMS/IQR) directly
+    per sample in physical units (e.g. nJy at ZP=31.4) on GPU.
+
+    Parameters
+    ----------
+    raw : torch.Tensor
+        Raw detector flux tensor of shape (B, 1, H, W) or (B, H, W).
+    target : torch.Tensor, optional
+        Target instance segmentation tensor of shape (B, H, W) or (B, 1, H, W).
+        If provided, pixels where target == 0 are isolated as sky background.
+    gain : float, default 100.0
+        Detector conversion factor (e-/nJy) used as physical shot noise floor.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]:
+        (bg_median, bg_sigma), both shaped (B, 1, 1, 1).
+    """
+    b = raw.shape[0]
+    flat = raw.view(b, -1)
+    q_levels = torch.tensor([0.25, 0.50, 0.75], device=raw.device, dtype=raw.dtype)
+
+    if target is not None:
+        flat_tgt = target.view(b, -1)
+        bg_flat = torch.where(flat_tgt == 0, flat, torch.nan)
+        has_enough_bg = (flat_tgt == 0).sum(dim=1) >= 64
+        q = torch.nanquantile(bg_flat, q_levels, dim=1)  # (3, B)
+        if not has_enough_bg.all():
+            q_fallback = torch.quantile(flat, q_levels, dim=1)
+            q = torch.where(has_enough_bg.unsqueeze(0), q, q_fallback)
+    else:
+        q = torch.quantile(flat, q_levels, dim=1)
+
+    med = q[1].view(b, 1, 1, 1)
+    sig = ((q[2] - q[0]) / 1.349).view(b, 1, 1, 1)
+    med = torch.nan_to_num(med, nan=0.0)
+    sig = torch.nan_to_num(sig, nan=0.0)
+
+    # If input is noiseless or flat (sig < 1e-2), fall back to expected physical shot noise floor
+    poisson_floor = torch.sqrt(torch.clamp(med, min=0.0) / max(gain, 1e-4)).clamp(min=1.0)
+    sig = torch.where(sig < 1e-2, poisson_floor, sig)
+
+    return med, sig
+
+
 class GPUAstroAugmentation(nn.Module):
     """
     GPU-accelerated astronomical noise injection and spatial augmentations.
     Executed in VRAM on raw physical fluxes before stretching.
+    Directly measures background noise and scales noise injection in physical units (nJy).
 
     Parameters
     ----------
@@ -164,18 +216,31 @@ class GPUAstroAugmentation(nn.Module):
         Whether to apply astronomical noise injection during training.
     enable_spatial : bool, default True
         Whether to apply synchronized geometric transforms (rotations, flips).
+    auto_scale_noise : bool, default True
+        If True, directly measures background noise (RMS/IQR) from unmasked sky pixels
+        and scales read noise, sky pedestal shifts, and gradients accordingly.
+    gain : float, default 100.0
+        Detector electron conversion (e-/nJy for Roman WFI in nJy at zero point 31.4).
+    read_noise_scale : float, default 0.3
+        Read noise standard deviation as a fraction of measured background RMS.
+    sky_pedestal_scale : float, default 1.0
+        Sky pedestal shift standard deviation as a multiple of measured background RMS.
+    gradient_scale_range : Tuple[float, float], default (0.2, 2.5)
+        Tilted plane gradient slope amplitude range relative to measured background RMS.
     shot_noise_prob : float, default 0.5
         Probability of injecting Poisson photon counting shot noise.
-    gain : float, default 2.0
-        Detector electron gain (e-/DN).
-    read_noise_std : float, default 1.5
-        Standard deviation of Gaussian amplifier readout noise (in DN).
+    read_noise_std : float, default 5.0
+        Fixed standard deviation of readout noise in nJy (used when auto_scale_noise=False).
     read_noise_prob : float, default 0.5
         Probability of injecting readout noise.
-    sky_pedestal_std : float, default 3.0
-        Standard deviation of sky pedestal fluctuations (DN).
+    sky_pedestal_std : float, default 15.0
+        Fixed standard deviation of sky pedestal fluctuations in nJy (when auto_scale_noise=False).
     sky_pedestal_prob : float, default 0.5
         Probability of shifting sky background pedestal.
+    gradient_prob : float, default 0.5
+        Probability of applying tilted-plane background gradients.
+    gradient_sigma_range : Tuple[float, float], default (2.0, 25.0)
+        Fixed gradient slope range in nJy (when auto_scale_noise=False).
     flux_scale_range : Tuple[float, float], default (0.9, 1.1)
         Uniform random flux scaling range (zeropoint jitter).
     flux_scale_prob : float, default 0.5
@@ -192,14 +257,18 @@ class GPUAstroAugmentation(nn.Module):
         self,
         enable_noise: bool = True,
         enable_spatial: bool = True,
+        auto_scale_noise: bool = True,
+        gain: float = 100.0,
+        read_noise_scale: float = 0.3,
+        sky_pedestal_scale: float = 1.0,
+        gradient_scale_range: Tuple[float, float] = (0.2, 2.5),
         shot_noise_prob: float = 0.5,
-        gain: float = 2.0,
-        read_noise_std: float = 1.5,
+        read_noise_std: float = 5.0,
         read_noise_prob: float = 0.5,
-        sky_pedestal_std: float = 3.0,
+        sky_pedestal_std: float = 15.0,
         sky_pedestal_prob: float = 0.5,
         gradient_prob: float = 0.5,
-        gradient_sigma_range: Tuple[float, float] = (0.5, 4.0),
+        gradient_sigma_range: Tuple[float, float] = (2.0, 25.0),
         flux_scale_range: Tuple[float, float] = (0.9, 1.1),
         flux_scale_prob: float = 0.5,
         rot_prob: float = 0.5,
@@ -209,8 +278,12 @@ class GPUAstroAugmentation(nn.Module):
         super().__init__()
         self.enable_noise = enable_noise
         self.enable_spatial = enable_spatial
-        self.shot_noise_prob = shot_noise_prob
+        self.auto_scale_noise = auto_scale_noise
         self.gain = gain
+        self.read_noise_scale = read_noise_scale
+        self.sky_pedestal_scale = sky_pedestal_scale
+        self.gradient_scale_range = gradient_scale_range
+        self.shot_noise_prob = shot_noise_prob
         self.read_noise_std = read_noise_std
         self.read_noise_prob = read_noise_prob
         self.sky_pedestal_std = sky_pedestal_std
@@ -255,20 +328,33 @@ class GPUAstroAugmentation(nn.Module):
         if self.enable_noise:
             b, _, h, w = aug_raw.shape if aug_raw.ndim == 4 else (aug_raw.shape[0], 1, *aug_raw.shape[1:])
 
+            # Auto-measure physical background statistics per sample on GPU
+            if self.auto_scale_noise:
+                bg_med, bg_sigma = measure_background_noise(raw, target, gain=self.gain)
+                eff_read_std = bg_sigma * self.read_noise_scale
+                eff_pedestal_std = bg_sigma * self.sky_pedestal_scale
+                sig_low = bg_sigma * self.gradient_scale_range[0]
+                sig_high = bg_sigma * self.gradient_scale_range[1]
+            else:
+                eff_read_std = torch.full((b, 1, 1, 1), self.read_noise_std, device=raw.device, dtype=raw.dtype)
+                eff_pedestal_std = torch.full((b, 1, 1, 1), self.sky_pedestal_std, device=raw.device, dtype=raw.dtype)
+                sig_low = torch.full((b, 1, 1, 1), self.gradient_sigma_range[0], device=raw.device, dtype=raw.dtype)
+                sig_high = torch.full((b, 1, 1, 1), self.gradient_sigma_range[1], device=raw.device, dtype=raw.dtype)
+
             # A. Poisson Photon Shot Noise: sigma_shot = sqrt(max(0, F) / gain)
             if self.shot_noise_prob > 0 and torch.rand(1, device=raw.device).item() < self.shot_noise_prob:
                 shot_sigma = torch.sqrt(torch.clamp(aug_raw, min=0.0) / max(self.gain, 1e-4))
                 shot_noise = torch.randn_like(aug_raw) * shot_sigma
                 aug_raw = aug_raw + shot_noise
 
-            # B. Gaussian Detector Readout Noise: N(0, read_noise_std^2)
+            # B. Gaussian Detector Readout Noise: N(0, eff_read_std^2)
             if self.read_noise_prob > 0 and torch.rand(1, device=raw.device).item() < self.read_noise_prob:
-                read_noise = torch.randn_like(aug_raw) * self.read_noise_std
+                read_noise = torch.randn_like(aug_raw) * eff_read_std
                 aug_raw = aug_raw + read_noise
 
             # C. Sky Pedestal Shifts (simulates varying sky subtraction residuals)
             if self.sky_pedestal_prob > 0 and torch.rand(1, device=raw.device).item() < self.sky_pedestal_prob:
-                pedestal = torch.randn((b, 1, 1, 1), device=raw.device, dtype=raw.dtype) * self.sky_pedestal_std
+                pedestal = torch.randn((b, 1, 1, 1), device=raw.device, dtype=raw.dtype) * eff_pedestal_std
                 if aug_raw.ndim == 3:
                     pedestal = pedestal.squeeze(1)
                 aug_raw = aug_raw + pedestal
@@ -281,8 +367,8 @@ class GPUAstroAugmentation(nn.Module):
                 grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
 
                 # Sample variable standard deviation per sample
-                sig_low, sig_high = self.gradient_sigma_range
-                sigmas = torch.empty((b, 1, 1, 1), device=raw.device, dtype=raw.dtype).uniform_(sig_low, sig_high)
+                u_rand = torch.rand((b, 1, 1, 1), device=raw.device, dtype=raw.dtype)
+                sigmas = sig_low + u_rand * (sig_high - sig_low)
 
                 # Random slopes along x and y with sampled sigma
                 slope_x = torch.randn((b, 1, 1, 1), device=raw.device, dtype=raw.dtype) * sigmas

@@ -12,7 +12,12 @@ from astropy.io import fits
 
 from sam2roman.tools.build_webdataset import build_webdataset
 from sam2roman.training.webdataset_loader import create_webdataset_loader, resolve_shard_urls
-from sam2roman.training.gpu_transforms import GPULeakySB, GPUAstroAugmentation, GPUAstroTransform
+from sam2roman.training.gpu_transforms import (
+    GPULeakySB,
+    GPUAstroAugmentation,
+    GPUAstroTransform,
+    measure_background_noise,
+)
 from sam2roman.visualization.stretch import leakySB
 from sam2roman.training.unetpp_trainer import UNetPPTrainer
 
@@ -168,6 +173,26 @@ def test_gpu_astro_augmentation():
     eval_raw, eval_target = aug(raw, target)
     assert torch.allclose(eval_raw, raw)
     assert torch.allclose(eval_target, target)
+
+
+def test_measure_background_noise():
+    """Verify GPU-accelerated background noise and pedestal measurement."""
+    torch.manual_seed(42)
+    # Background level 25.0 nJy, noise dispersion 10.0 nJy
+    raw = torch.randn(4, 1, 128, 128, dtype=torch.float32) * 10.0 + 25.0
+    target = torch.zeros(4, 1, 128, 128, dtype=torch.int32)
+    # Put bright stars (10,000 nJy) in foreground
+    target[:, :, :20, :20] = 1
+    raw[:, :, :20, :20] = 10000.0
+
+    med, sig = measure_background_noise(raw, target)
+    assert med.shape == (4, 1, 1, 1)
+    assert sig.shape == (4, 1, 1, 1)
+
+    # Measured median should be close to 25.0 nJy, not contaminated by 10,000 nJy stars
+    assert torch.all(torch.abs(med - 25.0) < 2.0)
+    # Measured dispersion should be close to 10.0 nJy
+    assert torch.all(torch.abs(sig - 10.0) < 2.0)
 
 
 def test_gpu_astro_gradient_tilted_plane():
