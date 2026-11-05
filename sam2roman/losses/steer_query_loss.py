@@ -27,6 +27,7 @@ import torch.nn.functional as F
 def render_star_center_heatmap(
     inst_gt: torch.Tensor,
     sigma: float = 2.0,
+    centroids: Optional[List[List[Tuple[float, float]]]] = None,
 ) -> Tuple[torch.Tensor, List[List[Tuple[float, float]]]]:
     """
     Render 2D Gaussian star-center heatmaps at geometric centroids of star instances.
@@ -37,6 +38,8 @@ def render_star_center_heatmap(
         Integer instance mask of shape (B, H, W) where 0 is background/galaxy and k >= 1 are stars.
     sigma : float, default 2.0
         Gaussian standard deviation in pixels.
+    centroids : List[List[Tuple[float, float]]], optional
+        Precomputed centroids per sample. If provided, skips in-VRAM centroid derivation.
 
     Returns
     -------
@@ -48,53 +51,57 @@ def render_star_center_heatmap(
     device = inst_gt.device
     dtype = torch.float32
 
-    H_star_gt = torch.zeros(b, 1, h, w, device=device, dtype=dtype)
+    radius = int(math.ceil(3.0 * sigma))
+    ksize = 2 * radius + 1
+    coords = torch.arange(ksize, device=device, dtype=dtype) - radius
+    gy, gx = torch.meshgrid(coords, coords, indexing="ij")
+    kernel = torch.exp(-0.5 * (gx**2 + gy**2) / (sigma ** 2)).view(1, 1, ksize, ksize)
+
+    delta_map = torch.zeros(b, 1, h, w, device=device, dtype=dtype)
     batch_centroids: List[List[Tuple[float, float]]] = []
 
-    y_grid, x_grid = torch.meshgrid(
-        torch.arange(h, device=device, dtype=dtype),
-        torch.arange(w, device=device, dtype=dtype),
-        indexing="ij",
-    )
+    if centroids is not None and len(centroids) == b:
+        for i in range(b):
+            pts_i = centroids[i]
+            batch_centroids.append(pts_i)
+            for cx, cy in pts_i:
+                ix = int(round(cx))
+                iy = int(round(cy))
+                if 0 <= ix < w and 0 <= iy < h:
+                    delta_map[i, 0, iy, ix] = 1.0
+    else:
+        y_grid, x_grid = torch.meshgrid(
+            torch.arange(h, device=device, dtype=dtype),
+            torch.arange(w, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        flat_y = y_grid.reshape(-1)
+        flat_x = x_grid.reshape(-1)
 
-    radius = int(math.ceil(3.0 * sigma))
+        for i in range(b):
+            mask_i = inst_gt[i]
+            max_id = int(mask_i.max())
+            pts_i: List[Tuple[float, float]] = []
+            if max_id > 0:
+                flat_m = mask_i.reshape(-1).long()
+                counts = torch.bincount(flat_m, minlength=max_id + 1).float()
+                sum_y = torch.bincount(flat_m, weights=flat_y, minlength=max_id + 1)
+                sum_x = torch.bincount(flat_m, weights=flat_x, minlength=max_id + 1)
+                valid = counts > 0
+                valid[0] = False
+                valid_ids = torch.where(valid)[0]
+                if len(valid_ids) > 0:
+                    cy_t = sum_y[valid_ids] / counts[valid_ids]
+                    cx_t = sum_x[valid_ids] / counts[valid_ids]
+                    iy_t = cy_t.round().long().clamp(0, h - 1)
+                    ix_t = cx_t.round().long().clamp(0, w - 1)
+                    delta_map[i, 0, iy_t, ix_t] = 1.0
+                    cx_cpu = cx_t.tolist()
+                    cy_cpu = cy_t.tolist()
+                    pts_i = list(zip(cx_cpu, cy_cpu))
+            batch_centroids.append(pts_i)
 
-    for i in range(b):
-        mask_i = inst_gt[i]
-        unique_ids = torch.unique(mask_i)
-        unique_ids = unique_ids[unique_ids > 0]
-        centroids_i: List[Tuple[float, float]] = []
-
-        for inst_id in unique_ids:
-            ys, xs = torch.where(mask_i == inst_id)
-            if len(ys) == 0:
-                continue
-            cy = float(ys.float().mean().item())
-            cx = float(xs.float().mean().item())
-            centroids_i.append((cx, cy))
-
-            # Render Gaussian patch within 3*sigma
-            y_min = max(0, int(math.floor(cy - radius)))
-            y_max = min(h, int(math.ceil(cy + radius + 1)))
-            x_min = max(0, int(math.floor(cx - radius)))
-            x_max = min(w, int(math.ceil(cx + radius + 1)))
-
-            sub_y = y_grid[y_min:y_max, x_min:x_max]
-            sub_x = x_grid[y_min:y_max, x_min:x_max]
-            dist_sq = (sub_y - cy) ** 2 + (sub_x - cx) ** 2
-            patch = torch.exp(-0.5 * dist_sq / (sigma ** 2))
-
-            H_star_gt[i, 0, y_min:y_max, x_min:x_max] = torch.maximum(
-                H_star_gt[i, 0, y_min:y_max, x_min:x_max], patch
-            )
-
-            # Ensure exact center pixel is 1.0
-            cy_int = int(min(h - 1, max(0, round(cy))))
-            cx_int = int(min(w - 1, max(0, round(cx))))
-            H_star_gt[i, 0, cy_int, cx_int] = 1.0
-
-        batch_centroids.append(centroids_i)
-
+    H_star_gt = F.conv2d(delta_map, kernel, padding=radius).clamp(0.0, 1.0)
     return H_star_gt, batch_centroids
 
 
@@ -271,11 +278,10 @@ class SteerQueryLoss(nn.Module):
         gate_bce = F.binary_cross_entropy(G_fg, fg_target, weight=w_pix, reduction="mean")
         l_gate = gate_bce
 
-        # 5. Instance Query Matching Loss
-        n_queries = M_inst.shape[1]
-        l_inst_bce = torch.tensor(0.0, device=device)
-        l_inst_dice = torch.tensor(0.0, device=device)
-        matched_count = 0
+        # 5. Instance Query Matching Loss (Batched Vectorized Execution)
+        matched_preds = []
+        matched_targets = []
+        matched_weights = []
 
         for i in range(b):
             gt_pts = batch_centroids[i]
@@ -290,7 +296,7 @@ class SteerQueryLoss(nn.Module):
             assigned_queries = set()
 
             for k_idx, (gx, gy) in enumerate(gt_pts):
-                inst_id = unique_ids[k_idx].item() if k_idx < len(unique_ids) else None
+                inst_id = unique_ids[k_idx] if k_idx < len(unique_ids) else None
                 if inst_id is None:
                     continue
 
@@ -308,29 +314,25 @@ class SteerQueryLoss(nn.Module):
                 if best_q is None:
                     continue
 
-                pred_m = M_inst[i, best_q]  # (H, W) in [0, 1]
-                target_m = (inst_i == inst_id).float()
-                w_m = w_pix[i, 0]
+                matched_preds.append(M_inst[i, best_q])
+                matched_targets.append((inst_i == inst_id).float())
+                matched_weights.append(w_pix[i, 0])
 
-                # Weighted BCE
-                bce = F.binary_cross_entropy(
-                    pred_m.clamp(self.eps, 1.0 - self.eps), target_m, weight=w_m, reduction="mean"
-                )
+        if len(matched_preds) > 0:
+            m_preds = torch.stack(matched_preds, dim=0)
+            m_targets = torch.stack(matched_targets, dim=0)
+            m_weights = torch.stack(matched_weights, dim=0)
 
-                # Soft Dice
-                inter = (pred_m * target_m).sum()
-                denom = pred_m.sum() + target_m.sum()
-                dice = 1.0 - (2.0 * inter + self.eps) / (denom + self.eps)
-
-                l_inst_bce = l_inst_bce + bce
-                l_inst_dice = l_inst_dice + dice
-                matched_count += 1
-
-        if matched_count > 0:
-            l_inst_bce = l_inst_bce / matched_count
-            l_inst_dice = l_inst_dice / matched_count
-
-        l_inst = l_inst_bce + l_inst_dice
+            # Batched weighted BCE and Soft Dice across all matched stars
+            bce = F.binary_cross_entropy(
+                m_preds.clamp(self.eps, 1.0 - self.eps), m_targets, weight=m_weights, reduction="mean"
+            )
+            inter = (m_preds * m_targets).sum(dim=(1, 2))
+            denom = m_preds.sum(dim=(1, 2)) + m_targets.sum(dim=(1, 2))
+            dice = 1.0 - (2.0 * inter + self.eps) / (denom + self.eps)
+            l_inst = bce + dice.mean()
+        else:
+            l_inst = torch.tensor(0.0, device=device)
 
         total_loss = (
             self.sem_weight * l_sem

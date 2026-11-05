@@ -288,78 +288,61 @@ class StarCenterQuerySelector(nn.Module):
         H_star = torch.sigmoid(center_logits)
         E_query = self.query_embed_head(fused)
 
-        coords_list = []
-        scores_list = []
-        valid_list = []
+        # Peak extraction
+        if gt_centroids is None:
+            # Fully batched GPU NMS topk selection (no per-sample CPU loops)
+            nms_peaks = H_star * (H_star == F.max_pool2d(H_star, kernel_size=3, stride=1, padding=1)).float()
+            flat_scores = nms_peaks.view(b, -1)
+            scores, top_inds = torch.topk(flat_scores, self.N_max, dim=-1)
+            top_y = (top_inds // w).float()
+            top_x = (top_inds % w).float()
+            star_coords = torch.stack([top_x, top_y], dim=-1)
+            valid_mask = scores >= (self.tau_star if not self.training else 0.01)
+        else:
+            coords_list = []
+            scores_list = []
+            valid_list = []
+            nms_mask = (H_star == F.max_pool2d(H_star, kernel_size=3, stride=1, padding=1)) & (H_star > 1e-4)
 
-        # Peak extraction via 3x3 max-pooling NMS
-        nms_mask = (H_star == F.max_pool2d(H_star, kernel_size=3, stride=1, padding=1)) & (H_star > 1e-4)
+            for i in range(b):
+                c_img = H_star[i, 0]
+                if len(gt_centroids) > i and len(gt_centroids[i]) > 0:
+                    pts = gt_centroids[i][: self.N_max]
+                    cx_t = torch.tensor([p[0] for p in pts], device=device, dtype=dtype)
+                    cy_t = torch.tensor([p[1] for p in pts], device=device, dtype=dtype)
+                    if self.training:
+                        cx_t = cx_t + torch.randn_like(cx_t) * 0.5
+                        cy_t = cy_t + torch.randn_like(cy_t) * 0.5
+                    cx_t = cx_t.clamp(0, w - 1)
+                    cy_t = cy_t.clamp(0, h - 1)
 
-        for i in range(b):
-            c_img = H_star[i, 0]
-            # Teacher-forcing override if provided
-            if gt_centroids is not None and len(gt_centroids) > i and len(gt_centroids[i]) > 0:
-                pts = gt_centroids[i][: self.N_max]
-                cx_t = torch.tensor([p[0] for p in pts], device=device, dtype=dtype)
-                cy_t = torch.tensor([p[1] for p in pts], device=device, dtype=dtype)
-                # Add 1-px Gaussian jitter during training teacher-forcing
-                if self.training:
-                    cx_t = cx_t + torch.randn_like(cx_t) * 0.5
-                    cy_t = cy_t + torch.randn_like(cy_t) * 0.5
-                cx_t = cx_t.clamp(0, w - 1)
-                cy_t = cy_t.clamp(0, h - 1)
-
-                sc_vals = c_img[cy_t.long(), cx_t.long()]
-                k_valid = len(pts)
-                xy = torch.stack([cx_t, cy_t], dim=-1)
-                val_mask = torch.ones(k_valid, device=device, dtype=torch.bool)
-            else:
-                peak_mask = nms_mask[i, 0]
-                ys, xs = torch.where(peak_mask)
-                if len(ys) > 0:
-                    peak_scores = c_img[ys, xs]
-                    # Filter by tau_star during evaluation
-                    if not self.training:
-                        keep = peak_scores >= self.tau_star
-                        ys = ys[keep]
-                        xs = xs[keep]
-                        peak_scores = peak_scores[keep]
-
-                    if len(peak_scores) > 0:
-                        topk = min(self.N_max, len(peak_scores))
-                        top_vals, top_idx = torch.topk(peak_scores, topk)
-                        xy = torch.stack([xs[top_idx].float(), ys[top_idx].float()], dim=-1)
-                        sc_vals = top_vals
-                        k_valid = topk
-                        val_mask = torch.ones(k_valid, device=device, dtype=torch.bool)
-                    else:
-                        xy = torch.zeros(0, 2, device=device, dtype=dtype)
-                        sc_vals = torch.zeros(0, device=device, dtype=dtype)
-                        k_valid = 0
-                        val_mask = torch.zeros(0, device=device, dtype=torch.bool)
+                    sc_vals = c_img[cy_t.long(), cx_t.long()]
+                    k_valid = len(pts)
+                    xy = torch.stack([cx_t, cy_t], dim=-1)
+                    val_mask = torch.ones(k_valid, device=device, dtype=torch.bool)
                 else:
                     xy = torch.zeros(0, 2, device=device, dtype=dtype)
                     sc_vals = torch.zeros(0, device=device, dtype=dtype)
                     k_valid = 0
                     val_mask = torch.zeros(0, device=device, dtype=torch.bool)
 
-            # Pad up to N_max
-            pad_count = self.N_max - k_valid
-            if pad_count > 0:
-                pad_xy = torch.zeros(pad_count, 2, device=device, dtype=dtype)
-                pad_sc = torch.zeros(pad_count, device=device, dtype=dtype)
-                pad_val = torch.zeros(pad_count, device=device, dtype=torch.bool)
-                xy = torch.cat([xy, pad_xy], dim=0)
-                sc_vals = torch.cat([sc_vals, pad_sc], dim=0)
-                val_mask = torch.cat([val_mask, pad_val], dim=0)
+                # Pad up to N_max
+                pad_count = self.N_max - k_valid
+                if pad_count > 0:
+                    pad_xy = torch.zeros(pad_count, 2, device=device, dtype=dtype)
+                    pad_sc = torch.zeros(pad_count, device=device, dtype=dtype)
+                    pad_val = torch.zeros(pad_count, device=device, dtype=torch.bool)
+                    xy = torch.cat([xy, pad_xy], dim=0)
+                    sc_vals = torch.cat([sc_vals, pad_sc], dim=0)
+                    val_mask = torch.cat([val_mask, pad_val], dim=0)
 
-            coords_list.append(xy)
-            scores_list.append(sc_vals)
-            valid_list.append(val_mask)
+                coords_list.append(xy)
+                scores_list.append(sc_vals)
+                valid_list.append(val_mask)
 
-        star_coords = torch.stack(coords_list, dim=0)  # (B, N, 2)
-        scores = torch.stack(scores_list, dim=0)        # (B, N)
-        valid_mask = torch.stack(valid_list, dim=0)    # (B, N)
+            star_coords = torch.stack(coords_list, dim=0)  # (B, N, 2)
+            scores = torch.stack(scores_list, dim=0)        # (B, N)
+            valid_mask = torch.stack(valid_list, dim=0)    # (B, N)
 
         # Sample Q_0 from E_query at star_coords
         norm_x = (2.0 * star_coords[..., 0] / max(1, w - 1)) - 1.0

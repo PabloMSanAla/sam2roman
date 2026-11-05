@@ -190,7 +190,20 @@ class SteerQueryTrainer:
         else:
             sem_gt = derive_semantic_3class_from_instances(inst_gt)
 
-        H_star_gt, batch_centroids = render_star_center_heatmap(inst_gt, sigma=2.0)
+        meta_centroids = None
+        if "meta" in batch and isinstance(batch["meta"], list):
+            m_list = []
+            has_centroids = True
+            for m in batch["meta"]:
+                if isinstance(m, dict) and "centroids" in m:
+                    m_list.append([(float(c["cx"]), float(c["cy"])) for c in m["centroids"]])
+                else:
+                    has_centroids = False
+                    break
+            if has_centroids and len(m_list) == len(batch["meta"]):
+                meta_centroids = m_list
+
+        H_star_gt, batch_centroids = render_star_center_heatmap(inst_gt, sigma=2.0, centroids=meta_centroids)
         return images, inst_gt, sem_gt, H_star_gt, batch_centroids
 
     def train_epoch(
@@ -199,16 +212,16 @@ class SteerQueryTrainer:
         grad_accum_steps: int = 1,
         use_teacher_forcing: bool = False,
     ) -> Dict[str, float]:
-        """Execute one training epoch."""
+        """Execute one training epoch with zero host-device synchronization stalls."""
         self.model.train()
         if self.gpu_transform is not None:
             self.gpu_transform.train()
 
-        total_loss = 0.0
-        total_sem = 0.0
-        total_ctr = 0.0
-        total_gate = 0.0
-        total_inst = 0.0
+        total_loss_t = torch.zeros(1, device=self.device)
+        total_sem_t = torch.zeros(1, device=self.device)
+        total_ctr_t = torch.zeros(1, device=self.device)
+        total_gate_t = torch.zeros(1, device=self.device)
+        total_inst_t = torch.zeros(1, device=self.device)
         steps = 0
         self.optimizer.zero_grad()
 
@@ -230,11 +243,6 @@ class SteerQueryTrainer:
                 )
                 loss = loss_dict["loss"] / grad_accum_steps
 
-            if not torch.isfinite(loss):
-                logger.warning(f"Non-finite loss ({loss.item() * grad_accum_steps}) at step {steps}. Skipping.")
-                self.optimizer.zero_grad()
-                continue
-
             if self.scaler.is_enabled():
                 self.scaler.scale(loss).backward()
                 if (batch_idx + 1) % grad_accum_steps == 0:
@@ -252,11 +260,12 @@ class SteerQueryTrainer:
                     self.optimizer.step()
                     self.optimizer.zero_grad()
 
-            total_loss += loss.item() * grad_accum_steps
-            total_sem += loss_dict["sem_loss"].item()
-            total_ctr += loss_dict["center_loss"].item()
-            total_gate += loss_dict["gate_loss"].item()
-            total_inst += loss_dict["inst_loss"].item()
+            # Accumulate on-device without blocking CPU
+            total_loss_t += (loss * grad_accum_steps).detach()
+            total_sem_t += loss_dict["sem_loss"].detach()
+            total_ctr_t += loss_dict["center_loss"].detach()
+            total_gate_t += loss_dict["gate_loss"].detach()
+            total_inst_t += loss_dict["inst_loss"].detach()
             steps += 1
 
         if steps > 0 and (steps % grad_accum_steps) != 0:
@@ -274,11 +283,11 @@ class SteerQueryTrainer:
 
         n = max(1, steps)
         return {
-            "loss": total_loss / n,
-            "sem_loss": total_sem / n,
-            "center_loss": total_ctr / n,
-            "gate_loss": total_gate / n,
-            "inst_loss": total_inst / n,
+            "loss": float(total_loss_t.item()) / n,
+            "sem_loss": float(total_sem_t.item()) / n,
+            "center_loss": float(total_ctr_t.item()) / n,
+            "gate_loss": float(total_gate_t.item()) / n,
+            "inst_loss": float(total_inst_t.item()) / n,
         }
 
     def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:

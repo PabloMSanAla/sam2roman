@@ -19,9 +19,11 @@ source activate pyt2_6_gh
 
 PYTHON_BIN="$(which python)"
 
-# Optimize CPU threading and output flushing
+# Optimize CPU threading and memory allocation on GH200 (ARM 72 cores)
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
 echo "================================================================="
 echo " Job started on: $(hostname) at $(date)"
@@ -31,20 +33,26 @@ echo " Python Version: $($PYTHON_BIN --version 2>&1)"
 echo " Working directory: $(pwd)"
 echo "================================================================="
 
-# 2. Optional: Stage dataset shards to local fast NVMe SSD ($TMPDIR) or RAM (/dev/shm)
+# 2. Stage dataset shards to local fast NVMe SSD ($TMPDIR) or RAM (/dev/shm)
 # For a 103 GB dataset on GH200 (480 GB unified RAM + NVMe SSD), staging eliminates
-# NFS/Lustre network latency and prevents GPU utilization drops.
-# DATA_DIR="/nobackup/pmsanch1/data/webdataset_instance"
-# if [ -d "$TMPDIR" ]; then
-#     echo "[I/O] Staging shards to node-local NVMe SSD: $TMPDIR/shards..."
-#     mkdir -p "$TMPDIR/shards"
-#     cp -r "$DATA_DIR"/* "$TMPDIR/shards/"
-#     TRAIN_SHARDS="$TMPDIR/shards/train/*.tar"
-#     VAL_SHARDS="$TMPDIR/shards/val/*.tar"
-# else
-TRAIN_SHARDS="/nobackup/pmsanch1/data/webdataset_instance/train/*.tar"
-VAL_SHARDS="/nobackup/pmsanch1/data/webdataset_instance/val/*.tar"
-# fi
+# Lustre/NFS network I/O latency and keeps GPU streaming at ~100% efficiency.
+DATA_DIR="/nobackup/pmsanch1/data/webdataset_instance"
+if [ -d "$TMPDIR" ]; then
+    echo "[I/O] Staging shards to node-local NVMe SSD: $TMPDIR/shards..."
+    mkdir -p "$TMPDIR/shards"
+    cp -r "$DATA_DIR"/* "$TMPDIR/shards/"
+    TRAIN_SHARDS="$TMPDIR/shards/train/*.tar"
+    VAL_SHARDS="$TMPDIR/shards/val/*.tar"
+elif [ -d "/dev/shm" ]; then
+    echo "[I/O] Staging shards to node RAM disk: /dev/shm/shards..."
+    mkdir -p "/dev/shm/shards"
+    cp -r "$DATA_DIR"/* "/dev/shm/shards/"
+    TRAIN_SHARDS="/dev/shm/shards/train/*.tar"
+    VAL_SHARDS="/dev/shm/shards/val/*.tar"
+else
+    TRAIN_SHARDS="/nobackup/pmsanch1/data/webdataset_instance/train/*.tar"
+    VAL_SHARDS="/nobackup/pmsanch1/data/webdataset_instance/val/*.tar"
+fi
 
 # 3. Launch GH200 SteerQuery Star-Deblending Training
 # batch_size=16 (fits safely within ~28 GB VRAM); grad_accum_steps=2 yields effective batch size 32.
