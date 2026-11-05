@@ -128,19 +128,25 @@ def select_val_cutouts_for_epoch(
     epoch: int,
     plot_interval: int = 5,
     num_cutouts: int = 4,
+    crowded_top_k: int = 16,
 ) -> List[Dict[str, Any]]:
     """
-    Rotate through the pool of crowded cutouts across inspection figure saves
-    so every saved visualization presents different challenging crowded scenes.
+    Randomly sample cutouts from the top most crowded validation pool for each figure save.
+    Maintains maximum scene crowding across all epochs instead of descending in density.
+    Uses epoch-seeded random selection for full reproducibility.
     """
     if not cutout_pool:
         return []
     if len(cutout_pool) <= num_cutouts:
         return cutout_pool
 
-    save_idx = max(0, (epoch // max(1, plot_interval)) - 1)
-    start_idx = (save_idx * num_cutouts) % len(cutout_pool)
-    return [cutout_pool[(start_idx + i) % len(cutout_pool)] for i in range(num_cutouts)]
+    # Focus exclusively on the top most crowded cutouts
+    pool_subset = cutout_pool[: max(num_cutouts, min(len(cutout_pool), crowded_top_k))]
+
+    # Seed with epoch for reproducible yet varying random combinations
+    rng = np.random.RandomState(seed=42 + epoch * 1000)
+    selected_indices = rng.choice(len(pool_subset), size=num_cutouts, replace=False)
+    return [pool_subset[i] for i in selected_indices]
 
 
 def plot_training_curves(

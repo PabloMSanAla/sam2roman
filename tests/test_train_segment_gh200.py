@@ -185,21 +185,25 @@ def test_plot_curves_and_validation(tmp_path):
 
 
 def test_select_crowded_cutouts_rotation():
-    """Verify cutout rotation between inspection figure epochs."""
-    pool = [{"id": i, "n_stars": i * 3} for i in range(12)]
+    """Verify random sampling from the most crowded cutouts across epochs."""
+    # Pool of 30 cutouts sorted descending by stars (ids 0..9 are most crowded)
+    pool = [{"id": i, "n_stars": 100 - i * 3} for i in range(30)]
 
-    # Epoch 5 (first interval)
-    c_ep5 = select_val_cutouts_for_epoch(pool, epoch=5, plot_interval=5, num_cutouts=4)
-    assert [c["id"] for c in c_ep5] == [0, 1, 2, 3]
+    c_ep5 = select_val_cutouts_for_epoch(pool, epoch=5, num_cutouts=4, crowded_top_k=10)
+    c_ep10 = select_val_cutouts_for_epoch(pool, epoch=10, num_cutouts=4, crowded_top_k=10)
+    c_ep15 = select_val_cutouts_for_epoch(pool, epoch=15, num_cutouts=4, crowded_top_k=10)
 
-    # Epoch 10 (second interval) -> changes to next cutouts
-    c_ep10 = select_val_cutouts_for_epoch(pool, epoch=10, plot_interval=5, num_cutouts=4)
-    assert [c["id"] for c in c_ep10] == [4, 5, 6, 7]
+    # 1. All selected cutouts must come exclusively from the top-10 crowded set
+    for batch in [c_ep5, c_ep10, c_ep15]:
+        assert len(batch) == 4
+        for item in batch:
+            assert item["id"] < 10
 
-    # Epoch 15 (third interval) -> changes to next cutouts
-    c_ep15 = select_val_cutouts_for_epoch(pool, epoch=15, plot_interval=5, num_cutouts=4)
-    assert [c["id"] for c in c_ep15] == [8, 9, 10, 11]
+    # 2. Different epochs choose different combinations
+    ids_ep5 = set(c["id"] for c in c_ep5)
+    ids_ep10 = set(c["id"] for c in c_ep10)
+    assert ids_ep5 != ids_ep10
 
-    # Epoch 20 -> wraps around cleanly
-    c_ep20 = select_val_cutouts_for_epoch(pool, epoch=20, plot_interval=5, num_cutouts=4)
-    assert [c["id"] for c in c_ep20] == [0, 1, 2, 3]
+    # 3. Deterministic for same epoch
+    c_ep5_repeat = select_val_cutouts_for_epoch(pool, epoch=5, num_cutouts=4, crowded_top_k=10)
+    assert [c["id"] for c in c_ep5] == [c["id"] for c in c_ep5_repeat]
