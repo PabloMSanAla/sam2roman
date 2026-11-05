@@ -232,10 +232,11 @@ class SteerQueryTrainer:
             if self.use_amp:
                 with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
                     preds = self.model(images, gt_centroids=centroids_tf)
-                    loss_dict = self.criterion(
-                        preds, inst_gt=inst_gt, sem_gt=sem_gt, H_star_gt=H_star_gt, image=images
-                    )
-                    loss = loss_dict["loss"] / grad_accum_steps
+                # Compute loss outside autocast in float32 for numerical stability & BCE safety
+                loss_dict = self.criterion(
+                    preds, inst_gt=inst_gt, sem_gt=sem_gt, H_star_gt=H_star_gt, image=images
+                )
+                loss = loss_dict["loss"] / grad_accum_steps
             else:
                 preds = self.model(images, gt_centroids=centroids_tf)
                 loss_dict = self.criterion(
@@ -308,9 +309,9 @@ class SteerQueryTrainer:
                 if self.use_amp:
                     with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
                         preds = self.model(images, gt_centroids=None)
-                        loss_dict = self.criterion(
-                            preds, inst_gt=inst_gt, sem_gt=sem_gt, H_star_gt=H_star_gt, image=images
-                        )
+                    loss_dict = self.criterion(
+                        preds, inst_gt=inst_gt, sem_gt=sem_gt, H_star_gt=H_star_gt, image=images
+                    )
                 else:
                     preds = self.model(images, gt_centroids=None)
                     loss_dict = self.criterion(

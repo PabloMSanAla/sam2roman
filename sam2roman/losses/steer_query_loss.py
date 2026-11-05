@@ -212,155 +212,159 @@ class SteerQueryLoss(nn.Module):
         image : torch.Tensor, optional
             Input image for high-flux galaxy weighting.
         """
-        logits_sem = predictions["logits_sem"]
-        H_star = predictions["H_star"]
-        M_inst = predictions["M_inst"]  # (B, N, H, W)
-        G_fg = predictions["G_fg"]      # (B, 1, H, W)
-        star_coords = predictions["star_coords"]  # (B, N, 2) [x, y]
+        device = predictions["logits_sem"].device
+        device_type = "cuda" if device.type == "cuda" else "cpu"
 
-        b, _, h, w = logits_sem.shape
-        device = logits_sem.device
+        # Execute loss in float32 outside autocast for numerical stability & BCE safety under AMP
+        with torch.autocast(device_type=device_type, enabled=False):
+            logits_sem = predictions["logits_sem"].float()
+            H_star = predictions["H_star"].float()
+            M_inst = predictions["M_inst"].float()
+            G_fg = predictions["G_fg"].float()
+            star_coords = predictions["star_coords"].float()
 
-        # If H_star_gt not provided, render dynamically
-        if H_star_gt is None:
-            H_star_gt, batch_centroids = render_star_center_heatmap(inst_gt, sigma=2.0)
-        else:
-            batch_centroids = []
+            b, _, h, w = logits_sem.shape
+
+            # If H_star_gt not provided, render dynamically
+            if H_star_gt is None:
+                H_star_gt, batch_centroids = render_star_center_heatmap(inst_gt, sigma=2.0)
+            else:
+                batch_centroids = []
+                for i in range(b):
+                    unique_ids = torch.unique(inst_gt[i])
+                    unique_ids = unique_ids[unique_ids > 0]
+                    pts = []
+                    for uid in unique_ids:
+                        ys, xs = torch.where(inst_gt[i] == uid)
+                        if len(ys) > 0:
+                            pts.append((float(xs.float().mean().item()), float(ys.float().mean().item())))
+                    batch_centroids.append(pts)
+
+            # 1. Semantic Loss: 3-class Cross-Entropy + Dice
+            sem_target = sem_gt.long()
+            ce_loss = self.ce_loss(logits_sem, sem_target).mean()
+
+            # Multiclass Dice Loss
+            prob_sem = F.softmax(logits_sem, dim=1)
+            sem_one_hot = F.one_hot(sem_target, num_classes=3).permute(0, 3, 1, 2).float()
+            intersection = (prob_sem * sem_one_hot).sum(dim=(2, 3))
+            cardinality = prob_sem.sum(dim=(2, 3)) + sem_one_hot.sum(dim=(2, 3))
+            dice_loss = 1.0 - (2.0 * intersection + self.eps) / (cardinality + self.eps)
+            l_sem = ce_loss + dice_loss.mean()
+
+            # 2. Center Heatmap Focal Loss (Zhou et al., CenterNet)
+            H_pred = H_star.clamp(self.eps, 1.0 - self.eps)
+            H_tgt = H_star_gt.clamp(0.0, 1.0)
+
+            pos_mask = H_tgt.eq(1.0)
+            neg_mask = H_tgt.lt(1.0)
+
+            pos_loss = torch.pow(1.0 - H_pred, self.center_alpha) * torch.log(H_pred) * pos_mask.float()
+            neg_loss = (
+                torch.pow(1.0 - H_tgt, self.center_beta)
+                * torch.pow(H_pred, self.center_alpha)
+                * torch.log(1.0 - H_pred)
+                * neg_mask.float()
+            )
+
+            num_pos = pos_mask.sum().float()
+            if num_pos > 0:
+                l_ctr = -(pos_loss.sum() + neg_loss.sum()) / num_pos
+            else:
+                l_ctr = -neg_loss.sum() / max(1.0, float(b))
+            l_ctr = torch.nan_to_num(l_ctr, nan=0.0, posinf=50.0, neginf=0.0)
+
+            # 3. Spike-over-galaxy pixel upweighting
+            w_pix = compute_spike_over_galaxy_weights(inst_gt, sem_gt, image=image, upweight_factor=3.0)
+
+            # 4. Spike-Bridging Gate Loss (Weighted BCE with foreground ground truth sem_gt > 0)
+            fg_target = (sem_gt > 0).unsqueeze(1).float()
+            gate_bce = F.binary_cross_entropy(G_fg, fg_target, weight=w_pix, reduction="mean")
+            l_gate = gate_bce
+
+            # 5. Instance Query Matching Loss (Batched Vectorized Execution)
+            matched_preds = []
+            matched_targets = []
+            matched_weights = []
+
             for i in range(b):
-                unique_ids = torch.unique(inst_gt[i])
+                gt_pts = batch_centroids[i]
+                if len(gt_pts) == 0:
+                    continue
+
+                inst_i = inst_gt[i]
+                unique_ids = torch.unique(inst_i)
                 unique_ids = unique_ids[unique_ids > 0]
-                pts = []
-                for uid in unique_ids:
-                    ys, xs = torch.where(inst_gt[i] == uid)
-                    if len(ys) > 0:
-                        pts.append((float(xs.float().mean().item()), float(ys.float().mean().item())))
-                batch_centroids.append(pts)
 
-        # 1. Semantic Loss: 3-class Cross-Entropy + Dice
-        sem_target = sem_gt.long()
-        ce_loss = self.ce_loss(logits_sem, sem_target).mean()
+                coords_i = star_coords[i]  # (N, 2) [x, y]
+                assigned_queries = set()
 
-        # Multiclass Dice Loss
-        prob_sem = F.softmax(logits_sem, dim=1)
-        sem_one_hot = F.one_hot(sem_target, num_classes=3).permute(0, 3, 1, 2).float()
-        intersection = (prob_sem * sem_one_hot).sum(dim=(2, 3))
-        cardinality = prob_sem.sum(dim=(2, 3)) + sem_one_hot.sum(dim=(2, 3))
-        dice_loss = 1.0 - (2.0 * intersection + self.eps) / (cardinality + self.eps)
-        l_sem = ce_loss + dice_loss.mean()
+                for k_idx, (gx, gy) in enumerate(gt_pts):
+                    inst_id = unique_ids[k_idx] if k_idx < len(unique_ids) else None
+                    if inst_id is None:
+                        continue
 
-        # 2. Center Heatmap Focal Loss (Zhou et al., CenterNet)
-        H_pred = H_star.clamp(self.eps, 1.0 - self.eps)
-        H_tgt = H_star_gt.clamp(0.0, 1.0)
+                    # Find nearest unassigned query
+                    dists = torch.sqrt((coords_i[:, 0] - gx) ** 2 + (coords_i[:, 1] - gy) ** 2)
+                    sorted_indices = torch.argsort(dists)
 
-        pos_mask = H_tgt.eq(1.0)
-        neg_mask = H_tgt.lt(1.0)
+                    best_q = None
+                    for q_idx in sorted_indices.tolist():
+                        if q_idx not in assigned_queries:
+                            best_q = q_idx
+                            assigned_queries.add(q_idx)
+                            break
 
-        pos_loss = torch.pow(1.0 - H_pred, self.center_alpha) * torch.log(H_pred) * pos_mask.float()
-        neg_loss = (
-            torch.pow(1.0 - H_tgt, self.center_beta)
-            * torch.pow(H_pred, self.center_alpha)
-            * torch.log(1.0 - H_pred)
-            * neg_mask.float()
-        )
+                    if best_q is None:
+                        continue
 
-        num_pos = pos_mask.sum().float()
-        if num_pos > 0:
-            l_ctr = -(pos_loss.sum() + neg_loss.sum()) / num_pos
-        else:
-            l_ctr = -neg_loss.sum() / max(1.0, float(b))
-        l_ctr = torch.nan_to_num(l_ctr, nan=0.0, posinf=50.0, neginf=0.0)
+                    matched_preds.append(M_inst[i, best_q])
+                    matched_targets.append((inst_i == inst_id).float())
+                    matched_weights.append(w_pix[i, 0])
 
-        # 3. Spike-over-galaxy pixel upweighting
-        w_pix = compute_spike_over_galaxy_weights(inst_gt, sem_gt, image=image, upweight_factor=3.0)
+            if len(matched_preds) > 0:
+                # Chunked evaluation (slices of 32 stars) avoids allocating multi-gigabyte
+                # tensors when hundreds of stars are matched across crowded fields
+                chunk_size = 32
+                num_matched = len(matched_preds)
+                total_bce = 0.0
+                total_dice = 0.0
 
-        # 4. Spike-Bridging Gate Loss (Weighted BCE with foreground ground truth sem_gt > 0)
-        fg_target = (sem_gt > 0).unsqueeze(1).float()
-        gate_bce = F.binary_cross_entropy(G_fg, fg_target, weight=w_pix, reduction="mean")
-        l_gate = gate_bce
+                for c_start in range(0, num_matched, chunk_size):
+                    c_end = min(c_start + chunk_size, num_matched)
+                    c_preds = torch.stack(matched_preds[c_start:c_end], dim=0)
+                    c_targets = torch.stack(matched_targets[c_start:c_end], dim=0)
+                    c_weights = torch.stack(matched_weights[c_start:c_end], dim=0)
 
-        # 5. Instance Query Matching Loss (Batched Vectorized Execution)
-        matched_preds = []
-        matched_targets = []
-        matched_weights = []
+                    bce_c = F.binary_cross_entropy(
+                        c_preds.clamp(self.eps, 1.0 - self.eps), c_targets, weight=c_weights, reduction="sum"
+                    )
+                    inter_c = (c_preds * c_targets).sum(dim=(1, 2))
+                    denom_c = c_preds.sum(dim=(1, 2)) + c_targets.sum(dim=(1, 2))
+                    dice_c = (1.0 - (2.0 * inter_c + self.eps) / (denom_c + self.eps)).sum()
 
-        for i in range(b):
-            gt_pts = batch_centroids[i]
-            if len(gt_pts) == 0:
-                continue
+                    total_bce = total_bce + bce_c
+                    total_dice = total_dice + dice_c
 
-            inst_i = inst_gt[i]
-            unique_ids = torch.unique(inst_i)
-            unique_ids = unique_ids[unique_ids > 0]
+                l_inst = (total_bce / (num_matched * h * w)) + (total_dice / num_matched)
+            else:
+                l_inst = torch.tensor(0.0, device=device)
 
-            coords_i = star_coords[i]  # (N, 2) [x, y]
-            assigned_queries = set()
+            total_loss = (
+                self.sem_weight * l_sem
+                + self.center_weight * l_ctr
+                + self.gate_weight * l_gate
+                + self.inst_weight * l_inst
+            )
+            total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=100.0, neginf=0.0)
 
-            for k_idx, (gx, gy) in enumerate(gt_pts):
-                inst_id = unique_ids[k_idx] if k_idx < len(unique_ids) else None
-                if inst_id is None:
-                    continue
-
-                # Find nearest unassigned query
-                dists = torch.sqrt((coords_i[:, 0] - gx) ** 2 + (coords_i[:, 1] - gy) ** 2)
-                sorted_indices = torch.argsort(dists)
-
-                best_q = None
-                for q_idx in sorted_indices.tolist():
-                    if q_idx not in assigned_queries:
-                        best_q = q_idx
-                        assigned_queries.add(q_idx)
-                        break
-
-                if best_q is None:
-                    continue
-
-                matched_preds.append(M_inst[i, best_q])
-                matched_targets.append((inst_i == inst_id).float())
-                matched_weights.append(w_pix[i, 0])
-
-        if len(matched_preds) > 0:
-            # Chunked evaluation (slices of 32 stars) avoids allocating multi-gigabyte
-            # tensors when hundreds of stars are matched across crowded fields
-            chunk_size = 32
-            num_matched = len(matched_preds)
-            total_bce = 0.0
-            total_dice = 0.0
-
-            for c_start in range(0, num_matched, chunk_size):
-                c_end = min(c_start + chunk_size, num_matched)
-                c_preds = torch.stack(matched_preds[c_start:c_end], dim=0)
-                c_targets = torch.stack(matched_targets[c_start:c_end], dim=0)
-                c_weights = torch.stack(matched_weights[c_start:c_end], dim=0)
-
-                bce_c = F.binary_cross_entropy(
-                    c_preds.clamp(self.eps, 1.0 - self.eps), c_targets, weight=c_weights, reduction="sum"
-                )
-                inter_c = (c_preds * c_targets).sum(dim=(1, 2))
-                denom_c = c_preds.sum(dim=(1, 2)) + c_targets.sum(dim=(1, 2))
-                dice_c = (1.0 - (2.0 * inter_c + self.eps) / (denom_c + self.eps)).sum()
-
-                total_bce = total_bce + bce_c
-                total_dice = total_dice + dice_c
-
-            l_inst = (total_bce / (num_matched * h * w)) + (total_dice / num_matched)
-        else:
-            l_inst = torch.tensor(0.0, device=device)
-
-        total_loss = (
-            self.sem_weight * l_sem
-            + self.center_weight * l_ctr
-            + self.gate_weight * l_gate
-            + self.inst_weight * l_inst
-        )
-        total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=100.0, neginf=0.0)
-
-        return {
-            "loss": total_loss,
-            "sem_loss": l_sem,
-            "center_loss": l_ctr,
-            "gate_loss": l_gate,
-            "inst_loss": l_inst,
-        }
+            return {
+                "loss": total_loss,
+                "sem_loss": l_sem,
+                "center_loss": l_ctr,
+                "gate_loss": l_gate,
+                "inst_loss": l_inst,
+            }
 
 
 def build_steer_query_optimizer(
