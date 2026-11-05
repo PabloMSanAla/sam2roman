@@ -61,12 +61,16 @@ def sync_s3_path(s3_uri: str, local_dest: Path) -> Path:
     return local_dest
 
 
-def extract_fixed_val_cutouts(
+def extract_crowded_val_cutouts(
     val_source: Union[str, Path, Sequence[Union[str, Path]], Any],
-    num_cutouts: int = 4,
+    pool_size: int = 32,
+    max_scan: int = 150,
 ) -> List[Dict[str, Any]]:
-    """Extract fixed validation cutouts for consistent visual progress tracking."""
-    cutouts: List[Dict[str, Any]] = []
+    """
+    Extract a diverse pool of the most crowded validation cutouts (highest star/source density)
+    to rigorously challenge and monitor deblending performance across epochs.
+    """
+    candidates: List[Tuple[int, Dict[str, Any]]] = []
 
     if isinstance(val_source, (str, Path)) or (
         isinstance(val_source, (list, tuple))
@@ -76,6 +80,7 @@ def extract_fixed_val_cutouts(
         try:
             shard_list = resolve_shard_urls(val_source)
             pipeline = wds.WebDataset(shard_list, shardshuffle=False).decode()
+            scanned = 0
             for sample in pipeline:
                 raw = None
                 target = None
@@ -89,17 +94,53 @@ def extract_fixed_val_cutouts(
                         meta = v if isinstance(v, dict) else {}
 
                 if raw is not None and target is not None:
-                    cutouts.append({
-                        "raw": np.asarray(raw, dtype=np.float32),
-                        "target": np.asarray(target),
-                        "meta": meta,
-                    })
-                    if len(cutouts) >= num_cutouts:
+                    tgt_arr = np.asarray(target)
+                    unique_ids = np.unique(tgt_arr)
+                    n_stars = int(len(unique_ids[unique_ids > 0]))
+
+                    candidates.append((
+                        n_stars,
+                        {
+                            "raw": np.asarray(raw, dtype=np.float32),
+                            "target": tgt_arr,
+                            "meta": meta,
+                            "n_stars": n_stars,
+                        }
+                    ))
+                    scanned += 1
+                    if scanned >= max_scan:
                         break
         except Exception as e:
-            logger.warning(f"Could not extract cutouts from WebDataset shards: {e}")
+            logger.warning(f"Could not extract crowded cutouts from WebDataset shards: {e}")
 
-    return cutouts
+    # Sort descending by star count (crowdest cutouts first)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    pool = [c[1] for c in candidates[:pool_size]]
+    return pool
+
+
+# Backwards-compatible alias
+extract_fixed_val_cutouts = extract_crowded_val_cutouts
+
+
+def select_val_cutouts_for_epoch(
+    cutout_pool: List[Dict[str, Any]],
+    epoch: int,
+    plot_interval: int = 5,
+    num_cutouts: int = 4,
+) -> List[Dict[str, Any]]:
+    """
+    Rotate through the pool of crowded cutouts across inspection figure saves
+    so every saved visualization presents different challenging crowded scenes.
+    """
+    if not cutout_pool:
+        return []
+    if len(cutout_pool) <= num_cutouts:
+        return cutout_pool
+
+    save_idx = max(0, (epoch // max(1, plot_interval)) - 1)
+    start_idx = (save_idx * num_cutouts) % len(cutout_pool)
+    return [cutout_pool[(start_idx + i) % len(cutout_pool)] for i in range(num_cutouts)]
 
 
 def plot_training_curves(
@@ -209,13 +250,13 @@ def plot_validation_examples(
                 vis_arr = vis_arr.squeeze(-1)
 
             # Col 1: Stretched Image
+            n_gt = len(np.unique(gt_inst)[np.unique(gt_inst) > 0])
             axes[i, 0].imshow(vis_arr, cmap="gray" if vis_arr.ndim == 2 else None)
-            axes[i, 0].set_title(f"Cutout #{i+1}: Roman WFI Flux")
+            axes[i, 0].set_title(f"Field #{i+1} ({n_gt} stars): WFI Flux")
             axes[i, 0].axis("off")
 
             # Col 2: Ground Truth Instances
             axes[i, 1].imshow(gt_inst, cmap="gist_ncar", interpolation="nearest")
-            n_gt = len(np.unique(gt_inst)[np.unique(gt_inst) > 0])
             axes[i, 1].set_title(f"GT Star Instances (N={n_gt})")
             axes[i, 1].axis("off")
 
@@ -352,23 +393,33 @@ def main():
         device=device,
     )
 
-    fixed_val_cutouts = None
+    val_cutout_pool = None
     if val_shards:
-        logger.info("Extracting fixed validation cutouts for periodic inference monitoring...")
-        fixed_val_cutouts = extract_fixed_val_cutouts(val_shards, num_cutouts=4)
-        if fixed_val_cutouts:
-            logger.info(f"Cached {len(fixed_val_cutouts)} fixed cutouts.")
+        logger.info("Scanning validation shards for crowded cutouts pool...")
+        val_cutout_pool = extract_crowded_val_cutouts(val_shards, pool_size=32, max_scan=150)
+        if val_cutout_pool:
+            star_counts = [c.get("n_stars", 0) for c in val_cutout_pool]
+            logger.info(
+                f"Cached {len(val_cutout_pool)} crowded cutouts (star counts: "
+                f"min={min(star_counts)}, max={max(star_counts)}, median={int(np.median(star_counts))})."
+            )
 
     def epoch_callback(trainer_inst: SteerQueryTrainer, epoch_data: Dict[str, Any], history: Dict[str, List[float]]) -> None:
         epoch = epoch_data["epoch"]
         epochs = epoch_data["epochs"]
         if epoch % args.plot_interval == 0 or epoch == epochs:
             plot_training_curves(history=history, output_dir=output_dir, current_epoch=epoch)
-            if fixed_val_cutouts:
+            if val_cutout_pool:
+                epoch_cutouts = select_val_cutouts_for_epoch(
+                    cutout_pool=val_cutout_pool,
+                    epoch=epoch,
+                    plot_interval=args.plot_interval,
+                    num_cutouts=4,
+                )
                 fig_path = output_dir / f"val_inference_epoch_{epoch:03d}.png"
                 plot_validation_examples(
                     model=trainer_inst.model,
-                    fixed_cutouts=fixed_val_cutouts,
+                    fixed_cutouts=epoch_cutouts,
                     gpu_transform=trainer_inst.gpu_transform,
                     output_path=fig_path,
                     epoch=epoch,
