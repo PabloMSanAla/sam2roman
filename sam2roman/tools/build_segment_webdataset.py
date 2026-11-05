@@ -28,8 +28,6 @@ import numpy as np
 import webdataset as wds
 from astropy.io import fits
 
-from sam2roman.training.offset_target import generate_center_offset_targets_numpy
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -181,17 +179,6 @@ def extract_instance_cutouts_from_file(
                 "target": relabeled_crop.astype(np.int32),
                 "meta": meta,
             }
-
-            if precompute_offsets:
-                fg, c_map, o_map, _ = generate_center_offset_targets_numpy(
-                    relabeled_crop,
-                    sigma=center_sigma,
-                    min_area=min_pixels_per_object,
-                )
-                sample_dict["fg"] = fg
-                sample_dict["center"] = c_map
-                sample_dict["offset"] = o_map
-
             samples.append(sample_dict)
 
             if max_samples is not None and len(samples) >= max_samples:
@@ -250,10 +237,6 @@ def write_segment_shards(
                     "target.npy": to_npy_bytes(s["target"]),
                     "json": to_json_bytes(s["meta"]),
                 }
-                if precompute_offsets:
-                    wds_record["fg.npy"] = to_npy_bytes(s["fg"])
-                    wds_record["center.npy"] = to_npy_bytes(s["center"])
-                    wds_record["offset.npy"] = to_npy_bytes(s["offset"])
 
                 sink.write(wds_record)
                 total_written += 1

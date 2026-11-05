@@ -1,14 +1,13 @@
 """
-Trainer engine for Multi-Task Center Offset UNet++ on astronomical datasets.
-=============================================================================
+Trainer engine for SteerQuery Star-Deblending UNet++.
+=====================================================
 
 Optimized for NVIDIA Grace Hopper (GH200):
-- TF32 & cuDNN benchmark
-- Native bfloat16 Automatic Mixed Precision (AMP)
-- Asynchronous CPU worker pre-computation ring buffer (72 ARM cores, 480GB RAM)
-- Fast non-blocking DMA streaming over NVLink-C2C
-- In-VRAM GPUAstroTransform (<0.05 ms per batch)
-- Periodic validation tracking: Center Peak F1, Offset EPE, Foreground IoU
+- TF32 & native bfloat16 Automatic Mixed Precision (AMP)
+- Two-speed optimizer (0.1x LR on geometric angle and curvature steering parameters)
+- Teacher-forcing query warmup during early epochs
+- Direct GPU integer instance mask assembly without CPU voting/clustering
+- Continuous validation tracking: Foreground IoU, Star Centroid F1, Gate Accuracy
 """
 
 from __future__ import annotations
@@ -22,23 +21,19 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from sam2roman.models.unetpp_offset import UNetPlusPlusCenterOffset
-from sam2roman.training.offset_losses import CenterOffsetCompositeLoss
-from sam2roman.training.offset_target import generate_center_offset_batch
-from sam2roman.training.offset_metrics import (
-    extract_center_peaks,
-    evaluate_center_detection,
-    compute_offset_epe,
+from sam2roman.models.steer_query_head import UNetPlusPlusSteerQuery
+from sam2roman.losses.steer_query_loss import (
+    SteerQueryLoss,
+    build_steer_query_optimizer,
+    render_star_center_heatmap,
 )
 from sam2roman.training.gpu_transforms import GPUAstroTransform
-from sam2roman.training.webdataset_loader import (
-    create_webdataset_loader,
-    CenterOffsetBatchCollator,
-)
+from sam2roman.training.webdataset_loader import create_webdataset_loader
 
-logger = logging.getLogger("sam2roman.center_offset_trainer")
+logger = logging.getLogger("sam2roman.steer_query_trainer")
 
 
 def _is_webdataset_shards(ds: Any) -> bool:
@@ -50,59 +45,57 @@ def _is_webdataset_shards(ds: Any) -> bool:
     return False
 
 
-class CenterOffsetTrainer:
+def derive_semantic_3class_from_instances(
+    inst_gt: torch.Tensor,
+    edge_width: int = 2,
+) -> torch.Tensor:
     """
-    Trainer for Center Offset Voting instance segmentation UNet++.
+    Derive 3-class semantic masks from integer instance masks:
+    0: Sky/background and unmasked galaxies
+    1: Star core/interior
+    2: Star boundary/diffraction spikes
+    """
+    b, h, w = inst_gt.shape
+    device = inst_gt.device
+    sem_gt = torch.zeros((b, h, w), device=device, dtype=torch.long)
 
-    Parameters
-    ----------
-    model : UNetPlusPlusCenterOffset, optional
-        Multi-task model. Auto-instantiated if None.
-    in_channels : int, default 3
-        Input channels (3 for leakySB RGB).
-    semantic_classes : int, default 1
-        Foreground classes (1 for binary BCE/Dice).
-    features : tuple of int, default (32, 64, 128, 256, 512)
-        Feature channels per level.
-    use_cca : bool, default True
-        Whether to enable Criss-Cross Attention at bottleneck and deep decoders.
-    learning_rate : float, default 6e-5
-        Initial AdamW learning rate.
-    weight_decay : float, default 1e-2
-        AdamW weight decay.
-    grad_clip_norm : float, default 1.0
-        Gradient clipping threshold.
-    semantic_weight : float, default 1.0
-        Weight for semantic foreground loss.
-    center_weight : float, default 2.0
-        Weight for center heatmap focal loss.
-    offset_weight : float, default 1.0
-        Weight for offset masked Smooth L1 loss.
-    angle_weight : float, default 0.5
-        Weight for directional angular cosine loss (diffraction spikes).
-    center_sigma : float, default 2.0
-        Gaussian sigma for target center peaks.
-    gpu_transform : nn.Module or bool, default True
-        GPU-accelerated leakySB stretch and astronomical noise transforms.
-    device : str or torch.device, optional
-        Target device ('cuda', 'mps', 'cpu'). Auto-detected if None.
+    # Foreground pixels
+    fg_mask = (inst_gt > 0).float().unsqueeze(1)  # (B, 1, H, W)
+    if not fg_mask.any():
+        return sem_gt
+
+    # Morphological erosion to separate interior from edges
+    pad = edge_width
+    pooled = -F.max_pool2d(-fg_mask, kernel_size=2 * pad + 1, stride=1, padding=pad)
+    eroded = (pooled > 0.5).squeeze(1)
+
+    fg_bool = fg_mask.squeeze(1).bool()
+    sem_gt[fg_bool] = 2  # Edge / spike
+    sem_gt[eroded] = 1   # Interior
+
+    return sem_gt
+
+
+class SteerQueryTrainer:
+    """
+    Trainer for SteerQuery UNet++ star deblending and instance segmentation.
     """
 
     def __init__(
         self,
-        model: Optional[UNetPlusPlusCenterOffset] = None,
+        model: Optional[UNetPlusPlusSteerQuery] = None,
         in_channels: int = 3,
-        semantic_classes: int = 1,
+        num_classes: int = 3,
         features: Tuple[int, ...] = (32, 64, 128, 256, 512),
-        use_cca: bool = True,
+        proto_dim: int = 32,
+        N_max: int = 128,
         learning_rate: float = 6e-5,
         weight_decay: float = 1e-2,
         grad_clip_norm: float = 1.0,
-        semantic_weight: float = 1.0,
+        sem_weight: float = 1.0,
         center_weight: float = 2.0,
-        offset_weight: float = 1.0,
-        angle_weight: float = 0.5,
-        center_sigma: float = 2.0,
+        gate_weight: float = 1.0,
+        inst_weight: float = 1.0,
         gpu_transform: Optional[Union[nn.Module, bool]] = True,
         device: Optional[Union[str, torch.device]] = None,
     ):
@@ -116,7 +109,6 @@ class CenterOffsetTrainer:
         else:
             self.device = torch.device(device)
 
-        # Optimize for CUDA Hopper / Ada architectures
         if self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
@@ -133,43 +125,37 @@ class CenterOffsetTrainer:
             self.amp_dtype = torch.float32
             self.scaler = torch.amp.GradScaler("cuda", enabled=False)
 
-        # Initialize model
         if model is not None:
             self.model = model.to(self.device)
         else:
-            self.model = UNetPlusPlusCenterOffset(
+            self.model = UNetPlusPlusSteerQuery(
                 in_channels=in_channels,
-                semantic_classes=semantic_classes,
+                num_classes=num_classes,
                 features=features,
-                use_cca=use_cca,
+                proto_dim=proto_dim,
+                N_max=N_max,
             ).to(self.device)
 
         self.in_channels = in_channels
-        self.semantic_classes = semantic_classes
+        self.num_classes = num_classes
         self.features = features
-        self.use_cca = use_cca
+        self.proto_dim = proto_dim
+        self.N_max = N_max
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.grad_clip_norm = grad_clip_norm
-        self.center_sigma = center_sigma
 
-        # Multi-task loss criterion
-        self.criterion = CenterOffsetCompositeLoss(
-            semantic_weight=semantic_weight,
+        self.criterion = SteerQueryLoss(
+            sem_weight=sem_weight,
             center_weight=center_weight,
-            offset_weight=offset_weight,
-            angle_weight=angle_weight,
+            gate_weight=gate_weight,
+            inst_weight=inst_weight,
         ).to(self.device)
 
-        # Optimizer
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay,
-            betas=(0.9, 0.999),
+        self.optimizer = build_steer_query_optimizer(
+            self.model, base_lr=learning_rate, weight_decay=weight_decay
         )
 
-        # In-VRAM GPU transform
         if isinstance(gpu_transform, nn.Module):
             self.gpu_transform = gpu_transform.to(self.device)
         elif gpu_transform is True:
@@ -177,69 +163,70 @@ class CenterOffsetTrainer:
         else:
             self.gpu_transform = None
 
-    def _prepare_targets(
+    def _prepare_inputs_and_targets(
         self, batch: Dict[str, Any]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Extract or generate (fg_target, center_target, offset_target) from batch.
-        """
-        # If precomputed in shard:
-        if "fg" in batch and "center" in batch and "offset" in batch:
-            fg_t = batch["fg"].to(self.device, non_blocking=True).float()
-            c_t = batch["center"].to(self.device, non_blocking=True).float()
-            o_t = batch["offset"].to(self.device, non_blocking=True).float()
-            return fg_t, c_t, o_t
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[List[Tuple[float, float]]]]:
+        """Extract and prepare images, instance ground truth, semantics, and centroids."""
+        if "image" in batch:
+            images = batch["image"].to(self.device, non_blocking=True)
+        elif "raw" in batch:
+            raw = batch["raw"].to(self.device, non_blocking=True)
+            if self.gpu_transform is not None:
+                images, _ = self.gpu_transform(raw, None)
+            else:
+                images = raw
+        else:
+            raise KeyError(f"Expected 'image' or 'raw' in batch, got {list(batch.keys())}")
 
-        # Otherwise, dynamically generate from integer instance masks (Option A)
-        target_mask = batch["target"]  # (B, H, W)
-        fg_t, c_t, o_t = generate_center_offset_batch(
-            target_mask,
-            sigma=self.center_sigma,
-            device=self.device,
-        )
-        return fg_t, c_t, o_t
+        inst_gt = batch["target"].to(self.device, non_blocking=True).int()
 
-    def train_epoch(self, dataloader: DataLoader, grad_accum_steps: int = 1) -> Dict[str, float]:
-        """Execute one complete training epoch."""
+        if "semantic" in batch:
+            sem_gt = batch["semantic"].to(self.device, non_blocking=True).long()
+        else:
+            sem_gt = derive_semantic_3class_from_instances(inst_gt)
+
+        H_star_gt, batch_centroids = render_star_center_heatmap(inst_gt, sigma=2.0)
+        return images, inst_gt, sem_gt, H_star_gt, batch_centroids
+
+    def train_epoch(
+        self,
+        dataloader: DataLoader,
+        grad_accum_steps: int = 1,
+        use_teacher_forcing: bool = False,
+    ) -> Dict[str, float]:
+        """Execute one training epoch."""
         self.model.train()
         if self.gpu_transform is not None:
             self.gpu_transform.train()
 
         total_loss = 0.0
         total_sem = 0.0
-        total_center = 0.0
-        total_offset = 0.0
-        total_ang = 0.0
+        total_ctr = 0.0
+        total_gate = 0.0
+        total_inst = 0.0
         steps = 0
         self.optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(dataloader):
-            if "image" in batch:
-                images = batch["image"].to(self.device, non_blocking=True)
-            elif "raw" in batch:
-                raw = batch["raw"].to(self.device, non_blocking=True)
-                if self.gpu_transform is not None:
-                    # Stretches raw counts into normalized [0, 1] RGB in VRAM (<0.05 ms)
-                    images, _ = self.gpu_transform(raw, None)
-                else:
-                    images = raw
-            else:
-                raise KeyError(f"Expected 'image' or 'raw' key in batch, got {list(batch.keys())}")
-
-            fg_t, c_t, o_t = self._prepare_targets(batch)
+            images, inst_gt, sem_gt, H_star_gt, batch_centroids = self._prepare_inputs_and_targets(batch)
+            centroids_tf = batch_centroids if use_teacher_forcing else None
 
             if self.use_amp:
                 with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
-                    preds = self.model(images)
-                    loss_dict = self.criterion(preds, fg_t, c_t, o_t)
+                    preds = self.model(images, gt_centroids=centroids_tf)
+                    loss_dict = self.criterion(
+                        preds, inst_gt=inst_gt, sem_gt=sem_gt, H_star_gt=H_star_gt, image=images
+                    )
                     loss = loss_dict["loss"] / grad_accum_steps
             else:
-                preds = self.model(images)
-                loss_dict = self.criterion(preds, fg_t, c_t, o_t)
+                preds = self.model(images, gt_centroids=centroids_tf)
+                loss_dict = self.criterion(
+                    preds, inst_gt=inst_gt, sem_gt=sem_gt, H_star_gt=H_star_gt, image=images
+                )
                 loss = loss_dict["loss"] / grad_accum_steps
 
             if not torch.isfinite(loss):
-                logger.warning(f"Non-finite loss ({loss.item() * grad_accum_steps}) at step {steps}. Skipping backward.")
+                logger.warning(f"Non-finite loss ({loss.item() * grad_accum_steps}) at step {steps}. Skipping.")
                 self.optimizer.zero_grad()
                 continue
 
@@ -262,12 +249,11 @@ class CenterOffsetTrainer:
 
             total_loss += loss.item() * grad_accum_steps
             total_sem += loss_dict["sem_loss"].item()
-            total_center += loss_dict["center_loss"].item()
-            total_offset += loss_dict["offset_loss"].item()
-            total_ang += loss_dict["angle_loss"].item()
+            total_ctr += loss_dict["center_loss"].item()
+            total_gate += loss_dict["gate_loss"].item()
+            total_inst += loss_dict["inst_loss"].item()
             steps += 1
 
-        # Final gradient update for remainder batches
         if steps > 0 and (steps % grad_accum_steps) != 0:
             if self.scaler.is_enabled():
                 if self.grad_clip_norm > 0:
@@ -285,9 +271,9 @@ class CenterOffsetTrainer:
         return {
             "loss": total_loss / n,
             "sem_loss": total_sem / n,
-            "center_loss": total_center / n,
-            "offset_loss": total_offset / n,
-            "angle_loss": total_ang / n,
+            "center_loss": total_ctr / n,
+            "gate_loss": total_gate / n,
+            "inst_loss": total_inst / n,
         }
 
     def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:
@@ -297,75 +283,73 @@ class CenterOffsetTrainer:
             self.gpu_transform.eval()
 
         total_loss = 0.0
-        total_f1 = 0.0
-        total_mae = 0.0
-        total_epe = 0.0
         total_fg_iou = 0.0
+        total_star_f1 = 0.0
         steps = 0
 
         with torch.no_grad():
             for batch in dataloader:
-                if "image" in batch:
-                    images = batch["image"].to(self.device, non_blocking=True)
-                elif "raw" in batch:
-                    raw = batch["raw"].to(self.device, non_blocking=True)
-                    if self.gpu_transform is not None:
-                        images, _ = self.gpu_transform(raw, None)
-                    else:
-                        images = raw
-                else:
-                    raise KeyError(f"Expected 'image' or 'raw' in batch, got {list(batch.keys())}")
-
-                fg_t, c_t, o_t = self._prepare_targets(batch)
+                images, inst_gt, sem_gt, H_star_gt, batch_centroids = self._prepare_inputs_and_targets(batch)
 
                 if self.use_amp:
                     with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
-                        preds = self.model(images)
-                        loss_dict = self.criterion(preds, fg_t, c_t, o_t)
+                        preds = self.model(images, gt_centroids=None)
+                        loss_dict = self.criterion(
+                            preds, inst_gt=inst_gt, sem_gt=sem_gt, H_star_gt=H_star_gt, image=images
+                        )
                 else:
-                    preds = self.model(images)
-                    loss_dict = self.criterion(preds, fg_t, c_t, o_t)
+                    preds = self.model(images, gt_centroids=None)
+                    loss_dict = self.criterion(
+                        preds, inst_gt=inst_gt, sem_gt=sem_gt, H_star_gt=H_star_gt, image=images
+                    )
 
                 total_loss += loss_dict["loss"].item()
 
-                # Compute foreground IoU
-                pred_fg_mask = (torch.sigmoid(preds["semantic"]) >= 0.5).squeeze(1)
-                gt_fg = (fg_t > 0).squeeze(1)
-                intersection = (pred_fg_mask & gt_fg).sum().float().item()
-                union = (pred_fg_mask | gt_fg).sum().float().item()
-                iou = intersection / max(1.0, union)
+                # 1. Foreground IoU of predicted star masks vs ground truth stars
+                pred_fg = preds["instance_mask"] > 0
+                gt_fg = inst_gt > 0
+                inter = (pred_fg & gt_fg).sum().float().item()
+                union = (pred_fg | gt_fg).sum().float().item()
+                iou = inter / max(1.0, union)
                 total_fg_iou += iou
 
-                # Compute Offset EPE
-                epe = compute_offset_epe(preds["offset"], o_t, fg_t)
-                total_epe += epe
+                # 2. Star Detection F1 on first item of batch
+                pts_gt = batch_centroids[0]
+                coords_pred = preds["star_coords"][0]  # (N, 2)
+                scores_pred = preds["scores"][0]
+                keep = scores_pred >= 0.30
+                coords_pred = coords_pred[keep]
 
-                # Compute Center Peak F1 on first item of batch for speed
-                pred_c_prob = torch.sigmoid(preds["center"][0, 0]).float().cpu().numpy()
-                peaks = extract_center_peaks(pred_c_prob, threshold=0.3, min_distance=3)
+                if len(pts_gt) == 0 and len(coords_pred) == 0:
+                    f1 = 1.0
+                elif len(pts_gt) == 0 or len(coords_pred) == 0:
+                    f1 = 0.0
+                else:
+                    tp = 0
+                    matched_gt = set()
+                    for px, py in coords_pred.tolist():
+                        for g_idx, (gx, gy) in enumerate(pts_gt):
+                            if g_idx in matched_gt:
+                                continue
+                            dist = math.sqrt((px - gx) ** 2 + (py - gy) ** 2)
+                            if dist <= 3.0:
+                                tp += 1
+                                matched_gt.add(g_idx)
+                                break
+                    fp = len(coords_pred) - tp
+                    fn = len(pts_gt) - tp
+                    prec = tp / max(1, tp + fp)
+                    rec = tp / max(1, tp + fn)
+                    f1 = 2 * prec * rec / max(1e-8, prec + rec)
 
-                # Extract ground truth centroids from target mask
-                gt_mask_0 = batch["target"][0].detach().cpu().numpy()
-                gt_ids = np.unique(gt_mask_0)
-                gt_ids = gt_ids[gt_ids > 0]
-                gt_centroids = []
-                for gid in gt_ids:
-                    ys, xs = np.where(gt_mask_0 == gid)
-                    if len(ys) > 0:
-                        gt_centroids.append((float(np.mean(ys)), float(np.mean(xs))))
-
-                det_res = evaluate_center_detection(peaks, gt_centroids, tolerance=2.0)
-                total_f1 += det_res["f1"]
-                total_mae += det_res["mae"]
+                total_star_f1 += f1
                 steps += 1
 
         n = max(1, steps)
         return {
             "val_loss": total_loss / n,
             "fg_iou": total_fg_iou / n,
-            "center_f1": total_f1 / n,
-            "center_mae": total_mae / n,
-            "offset_epe": total_epe / n,
+            "star_f1": total_star_f1 / n,
         }
 
     def train(
@@ -373,23 +357,18 @@ class CenterOffsetTrainer:
         dataset: Any,
         val_dataset: Optional[Any] = None,
         epochs: int = 50,
-        batch_size: int = 32,
+        batch_size: int = 16,
         grad_accum_steps: int = 1,
         scheduler_type: str = "cosine",
-        warmup_epochs: int = 3,
+        warmup_epochs: int = 5,
         num_workers: int = 16,
-        prefetch_factor: int = 8,
+        prefetch_factor: int = 4,
         output_dir: Optional[Union[str, Path]] = None,
         log_file: Optional[str] = "epoch_log.txt",
         epoch_callback: Optional[Callable[[Any, Dict[str, Any], Dict[str, List[float]]], None]] = None,
         verbose: bool = True,
     ) -> Dict[str, List[float]]:
-        """
-        Execute full multi-epoch training run.
-        """
-        collator = CenterOffsetBatchCollator(sigma=self.center_sigma)
-
-        # Build DataLoaders
+        """Execute multi-epoch training with teacher-forcing query warmup."""
         if _is_webdataset_shards(dataset):
             train_loader = create_webdataset_loader(
                 urls=dataset,
@@ -398,7 +377,6 @@ class CenterOffsetTrainer:
                 num_workers=num_workers,
                 prefetch_factor=prefetch_factor,
                 persistent_workers=True if num_workers > 0 else False,
-                collate_fn=collator,
             )
         elif isinstance(dataset, DataLoader):
             train_loader = dataset
@@ -421,7 +399,6 @@ class CenterOffsetTrainer:
                     num_workers=max(1, num_workers // 2),
                     prefetch_factor=prefetch_factor,
                     persistent_workers=True if num_workers > 0 else False,
-                    collate_fn=collator,
                 )
             elif isinstance(val_dataset, DataLoader):
                 val_loader = val_dataset
@@ -434,7 +411,6 @@ class CenterOffsetTrainer:
                     pin_memory=True if self.device.type == "cuda" else False,
                 )
 
-        # Scheduler
         if scheduler_type == "cosine":
             warmup_sched = torch.optim.lr_scheduler.LinearLR(
                 self.optimizer, start_factor=0.1, total_iters=warmup_epochs
@@ -458,21 +434,26 @@ class CenterOffsetTrainer:
             "loss": [],
             "sem_loss": [],
             "center_loss": [],
-            "offset_loss": [],
-            "angle_loss": [],
+            "gate_loss": [],
+            "inst_loss": [],
             "val_loss": [],
             "fg_iou": [],
-            "center_f1": [],
-            "offset_epe": [],
+            "star_f1": [],
             "lr": [],
         }
 
         best_val_loss = float("inf")
-        logger.info(f"Beginning Center Offset UNet++ training: {epochs} epochs, batch_size={batch_size}")
+        logger.info(f"Beginning SteerQuery UNet++ training: {epochs} epochs, batch_size={batch_size}")
 
         for epoch in range(1, epochs + 1):
             t0 = time.time()
-            train_metrics = self.train_epoch(train_loader, grad_accum_steps=grad_accum_steps)
+            # Enable teacher forcing during warmup epochs
+            use_tf = epoch <= warmup_epochs
+            train_metrics = self.train_epoch(
+                train_loader,
+                grad_accum_steps=grad_accum_steps,
+                use_teacher_forcing=use_tf,
+            )
 
             val_metrics: Dict[str, float] = {}
             if val_loader is not None:
@@ -485,32 +466,29 @@ class CenterOffsetTrainer:
             history["loss"].append(train_metrics["loss"])
             history["sem_loss"].append(train_metrics["sem_loss"])
             history["center_loss"].append(train_metrics["center_loss"])
-            history["offset_loss"].append(train_metrics["offset_loss"])
-            history["angle_loss"].append(train_metrics["angle_loss"])
+            history["gate_loss"].append(train_metrics["gate_loss"])
+            history["inst_loss"].append(train_metrics["inst_loss"])
             history["lr"].append(current_lr)
 
             if val_metrics:
                 history["val_loss"].append(val_metrics["val_loss"])
                 history["fg_iou"].append(val_metrics["fg_iou"])
-                history["center_f1"].append(val_metrics["center_f1"])
-                history["offset_epe"].append(val_metrics["offset_epe"])
+                history["star_f1"].append(val_metrics["star_f1"])
             else:
                 history["val_loss"].append(train_metrics["loss"])
                 history["fg_iou"].append(0.0)
-                history["center_f1"].append(0.0)
-                history["offset_epe"].append(0.0)
+                history["star_f1"].append(0.0)
 
             dt = time.time() - t0
             val_loss = val_metrics.get("val_loss", train_metrics["loss"])
-            f1 = val_metrics.get("center_f1", 0.0)
-            epe = val_metrics.get("offset_epe", 0.0)
             iou = val_metrics.get("fg_iou", 0.0)
+            f1 = val_metrics.get("star_f1", 0.0)
 
             msg = (
                 f"Epoch {epoch:03d}/{epochs:03d} | Train Loss: {train_metrics['loss']:.4f} "
                 f"(sem: {train_metrics['sem_loss']:.3f}, ctr: {train_metrics['center_loss']:.3f}, "
-                f"off: {train_metrics['offset_loss']:.3f}, ang: {train_metrics['angle_loss']:.3f}) | "
-                f"Val Loss: {val_loss:.4f} | Fg IoU: {iou:.3f} | Center F1: {f1:.3f} | Offset EPE: {epe:.2f}px | "
+                f"gate: {train_metrics['gate_loss']:.3f}, inst: {train_metrics['inst_loss']:.3f}) | "
+                f"Val Loss: {val_loss:.4f} | Fg IoU: {iou:.3f} | Star F1: {f1:.3f} | "
                 f"LR: {current_lr:.2e} | {dt:.1f}s"
             )
             if verbose:
@@ -526,11 +504,12 @@ class CenterOffsetTrainer:
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
                     "in_channels": self.in_channels,
-                    "semantic_classes": self.semantic_classes,
+                    "num_classes": self.num_classes,
                     "features": self.features,
-                    "use_cca": self.use_cca,
+                    "proto_dim": self.proto_dim,
+                    "N_max": self.N_max,
                 },
-                out_path / "center_offset_latest.pt",
+                out_path / "steer_query_latest.pt",
             )
 
             # Save best checkpoint
@@ -543,11 +522,12 @@ class CenterOffsetTrainer:
                         "optimizer_state_dict": self.optimizer.state_dict(),
                         "val_loss": val_loss,
                         "in_channels": self.in_channels,
-                        "semantic_classes": self.semantic_classes,
+                        "num_classes": self.num_classes,
                         "features": self.features,
-                        "use_cca": self.use_cca,
+                        "proto_dim": self.proto_dim,
+                        "N_max": self.N_max,
                     },
-                    out_path / "center_offset_best.pt",
+                    out_path / "steer_query_best.pt",
                 )
 
             if epoch_callback is not None:

@@ -46,23 +46,25 @@ TRAIN_SHARDS="/nobackup/pmsanch1/data/webdataset_instance/train/*.tar"
 VAL_SHARDS="/nobackup/pmsanch1/data/webdataset_instance/val/*.tar"
 # fi
 
-# 3. Launch GH200 Center Offset Voting Training
+# 3. Launch GH200 SteerQuery Star-Deblending Training
 # batch_size=16 (fits safely within ~28 GB VRAM); grad_accum_steps=2 yields effective batch size 32.
 $PYTHON_BIN /nobackup/pmsanch1/code/sam2roman/cloud/train_segment_gh200.py \
     --train_shards "$TRAIN_SHARDS" \
     --val_shards "$VAL_SHARDS" \
-    --output_dir /nobackup/pmsanch1/experiments/segment_gh200_80epochs \
+    --output_dir /nobackup/pmsanch1/experiments/steer_query_gh200_80epochs \
     --batch_size 16 \
     --grad_accum_steps 2 \
     --epochs 80 \
     --lr 6e-5 \
     --num_workers 27 \
     --prefetch_factor 4 \
-    --use_cca \
+    --sem_weight 1.0 \
     --center_weight 2.0 \
-    --offset_weight 1.0 \
-    --angle_weight 0.5 \
-    --center_sigma 2.0 \
+    --gate_weight 1.0 \
+    --inst_weight 1.0 \
+    --warmup_epochs 5 \
+    --scheduler cosine \
+    --plot_interval 5
     --scheduler cosine --warmup_epochs 3 \
     --plot_interval 5
 

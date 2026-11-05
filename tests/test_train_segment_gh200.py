@@ -1,7 +1,7 @@
 """
-Unit tests for Grace Hopper (GH200) Center Offset training script:
+Unit tests for Grace Hopper (GH200) SteerQuery training script:
 - CLI argument parsing
-- CenterOffsetTrainer epoch training and checkpoint saving
+- SteerQueryTrainer epoch training, teacher-forcing, and checkpoint saving
 - Plotting functions for curves and 5-column validation figures
 """
 
@@ -12,8 +12,8 @@ import pytest
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from sam2roman.models.unetpp_offset import UNetPlusPlusCenterOffset
-from sam2roman.training.center_offset_trainer import CenterOffsetTrainer
+from sam2roman.models.steer_query_head import UNetPlusPlusSteerQuery
+from sam2roman.training.steer_query_trainer import SteerQueryTrainer
 from cloud.train_segment_gh200 import (
     build_parser,
     extract_fixed_val_cutouts,
@@ -56,29 +56,32 @@ def test_cli_parser():
         "--batch_size", "16",
         "--num_workers", "8",
         "--prefetch_factor", "4",
+        "--sem_weight", "1.0",
         "--center_weight", "2.5",
-        "--offset_weight", "1.5",
-        "--angle_weight", "0.8",
+        "--gate_weight", "1.2",
+        "--inst_weight", "1.5",
     ])
     assert args.epochs == 10
     assert args.batch_size == 16
     assert args.num_workers == 8
     assert args.prefetch_factor == 4
+    assert args.sem_weight == 1.0
     assert args.center_weight == 2.5
-    assert args.offset_weight == 1.5
-    assert args.angle_weight == 0.8
-    assert args.use_cca is True
+    assert args.gate_weight == 1.2
+    assert args.inst_weight == 1.5
 
 
-def test_center_offset_trainer_run(tmp_path):
-    """Verify CenterOffsetTrainer trains for 2 epochs and saves checkpoints."""
+def test_steer_query_trainer_run(tmp_path):
+    """Verify SteerQueryTrainer trains for 2 epochs and saves checkpoints."""
     ds = DummyInstanceDataset(n_samples=4)
     loader = DataLoader(ds, batch_size=2)
 
-    trainer = CenterOffsetTrainer(
-        in_channels=1,  # Raw 1-channel for dummy test
+    trainer = SteerQueryTrainer(
+        in_channels=1,
+        num_classes=3,
         features=(8, 16, 32, 64, 128),
-        use_cca=False,
+        proto_dim=16,
+        N_max=8,
         learning_rate=1e-3,
         gpu_transform=None,
         device="cpu",
@@ -89,6 +92,7 @@ def test_center_offset_trainer_run(tmp_path):
         val_dataset=loader,
         epochs=2,
         batch_size=2,
+        warmup_epochs=1,
         output_dir=tmp_path,
         log_file="epoch_log.txt",
         verbose=False,
@@ -97,36 +101,11 @@ def test_center_offset_trainer_run(tmp_path):
     assert len(history["loss"]) == 2
     assert len(history["val_loss"]) == 2
     assert (tmp_path / "epoch_log.txt").exists()
-    assert (tmp_path / "center_offset_latest.pt").exists()
-    assert (tmp_path / "center_offset_best.pt").exists()
-    best_ckpt = torch.load(tmp_path / "center_offset_best.pt", weights_only=False)
+    assert (tmp_path / "steer_query_latest.pt").exists()
+    assert (tmp_path / "steer_query_best.pt").exists()
+    best_ckpt = torch.load(tmp_path / "steer_query_best.pt", weights_only=False)
     assert "optimizer_state_dict" in best_ckpt
     assert (tmp_path / "training_metrics.json").exists()
-
-
-def test_center_offset_batch_collator():
-    """Verify CenterOffsetBatchCollator precomputes fg, center, and offset asynchronously."""
-    from sam2roman.training.webdataset_loader import CenterOffsetBatchCollator
-
-    collator = CenterOffsetBatchCollator(sigma=2.0)
-    raw_1 = np.ones((64, 64), dtype=np.float32)
-    tgt_1 = np.zeros((64, 64), dtype=np.int32)
-    tgt_1[20:30, 20:30] = 1
-
-    batch_input = [
-        (raw_1, tgt_1, {"id": 1}),
-        (raw_1 * 2, tgt_1 * 2, {"id": 2}),
-    ]
-    collated = collator(batch_input)
-
-    assert "raw" in collated
-    assert "target" in collated
-    assert "fg" in collated
-    assert "center" in collated
-    assert "offset" in collated
-    assert collated["fg"].shape == (2, 1, 64, 64)
-    assert collated["center"].shape == (2, 1, 64, 64)
-    assert collated["offset"].shape == (2, 2, 64, 64)
 
 
 def test_grad_accum_steps(tmp_path):
@@ -134,10 +113,12 @@ def test_grad_accum_steps(tmp_path):
     ds = DummyInstanceDataset(n_samples=4)
     loader = DataLoader(ds, batch_size=2)
 
-    trainer = CenterOffsetTrainer(
+    trainer = SteerQueryTrainer(
         in_channels=1,
+        num_classes=3,
         features=(8, 16, 32, 64, 128),
-        use_cca=False,
+        proto_dim=16,
+        N_max=8,
         learning_rate=1e-3,
         gpu_transform=None,
         device="cpu",
@@ -161,21 +142,22 @@ def test_plot_curves_and_validation(tmp_path):
         "loss": [0.8, 0.5],
         "sem_loss": [0.4, 0.2],
         "center_loss": [0.2, 0.15],
-        "offset_loss": [0.2, 0.15],
-        "angle_loss": [0.1, 0.05],
+        "gate_loss": [0.2, 0.15],
+        "inst_loss": [0.1, 0.05],
         "val_loss": [0.7, 0.45],
         "fg_iou": [0.5, 0.7],
-        "center_f1": [0.6, 0.8],
-        "offset_epe": [3.5, 2.1],
+        "star_f1": [0.6, 0.8],
     }
 
     curve_path = plot_training_curves(history, tmp_path, current_epoch=2)
     assert curve_path.exists()
 
-    model = UNetPlusPlusCenterOffset(
+    model = UNetPlusPlusSteerQuery(
         in_channels=1,
+        num_classes=3,
         features=(8, 16, 32, 64, 128),
-        use_cca=False,
+        proto_dim=16,
+        N_max=8,
     )
 
     cutouts = [

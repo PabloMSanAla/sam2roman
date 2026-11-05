@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """
-NVIDIA Grace Hopper (GH200) Center Offset Voting Training Script for sam2roman
-=============================================================================
+NVIDIA Grace Hopper (GH200) SteerQuery Star-Deblending Training Script for sam2roman
+===================================================================================
 
 Optimized for NVIDIA Grace Hopper (GH200):
 - Grace CPU: 72 ARM Neoverse-V2 cores with 480GB unified LPDDR5X RAM
 - Hopper H100 GPU: 96GB/144GB HBM3 VRAM, 4 PFLOPS Tensor Cores
 - NVLink-C2C: 900 GB/s bidirectional host-to-device streaming
-- Asynchronous CPU pre-computation ring buffer (Option A):
-  * 16-24 worker processes generate Gaussian center heatmaps and (dy, dx) offset fields
-  * Pinned memory ring buffer holds 64-128 pre-augmented batches
-- In-VRAM GPUAstroTransform (<0.05 ms per batch):
-  * Vectorized GPU leakySB stretch
-  * Astronomical Poisson shot noise and readout noise injection
+- Direct GPU Integer Instance Mask Assembly without CPU voting or clustering
+- Two-speed optimizer: 0.1x LR on geometric angle and curvature steering parameters
+- Star-only instance deblending (galaxies strictly preserved as background ID = 0)
 - Full TF32 and native bfloat16 Automatic Mixed Precision (AMP)
-- Multi-Task UNet++ with optional Recurrent Criss-Cross Attention (RCCA)
-- Sustained ~100% GPU compute utilization
 """
 
 from __future__ import annotations
@@ -40,20 +35,17 @@ import numpy as np
 import torch
 import webdataset as wds
 
-from sam2roman.models.unetpp_offset import UNetPlusPlusCenterOffset
-from sam2roman.training.center_offset_trainer import CenterOffsetTrainer
-from sam2roman.training.offset_target import generate_center_offset_targets_numpy
-from sam2roman.training.offset_metrics import extract_center_peaks
+from sam2roman.models.steer_query_head import UNetPlusPlusSteerQuery
+from sam2roman.training.steer_query_trainer import SteerQueryTrainer
 from sam2roman.training.gpu_transforms import GPUAstroTransform
-from sam2roman.training.webdataset_loader import create_webdataset_loader, resolve_shard_urls
-from sam2roman.inference.center_offset_segmentor import CenterOffsetSegmentor
+from sam2roman.training.webdataset_loader import resolve_shard_urls
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("sam2roman.segment_gh200")
+logger = logging.getLogger("sam2roman.steer_query_gh200")
 
 
 def sync_s3_path(s3_uri: str, local_dest: Path) -> Path:
@@ -126,27 +118,23 @@ def plot_training_curves(
         ax1.plot(ep_range, history["sem_loss"], "--", label="Semantic Loss", color="gray", alpha=0.7)
     if "center_loss" in history:
         ax1.plot(ep_range, history["center_loss"], "--", label="Center Focal", color="coral", alpha=0.7)
-    if "offset_loss" in history:
-        ax1.plot(ep_range, history["offset_loss"], "--", label="Offset L1", color="purple", alpha=0.7)
-    if "angle_loss" in history:
-        ax1.plot(ep_range, history["angle_loss"], "--", label="Spike Angle Loss", color="teal", alpha=0.7)
+    if "gate_loss" in history:
+        ax1.plot(ep_range, history["gate_loss"], "--", label="Gate BCE", color="teal", alpha=0.7)
+    if "inst_loss" in history:
+        ax1.plot(ep_range, history["inst_loss"], "--", label="Instance Loss", color="purple", alpha=0.7)
     if history.get("val_loss"):
         ax1.plot(ep_range, history["val_loss"], "s--", label="Val Loss", color="crimson")
 
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("Loss")
-    ax1.set_title(f"GH200 Center Offset Convergence (Epoch {current_epoch})")
+    ax1.set_title(f"GH200 SteerQuery Convergence (Epoch {current_epoch})")
     ax1.grid(True, alpha=0.3)
     ax1.legend(loc="upper right")
 
-    if history.get("center_f1"):
-        ax2.plot(ep_range, history["center_f1"], "^-", label="Center Peak F1", color="forestgreen")
+    if history.get("star_f1"):
+        ax2.plot(ep_range, history["star_f1"], "^-", label="Star Detection F1", color="forestgreen")
     if history.get("fg_iou"):
         ax2.plot(ep_range, history["fg_iou"], "o--", label="Foreground IoU", color="darkcyan")
-    if history.get("offset_epe"):
-        ax2_right = ax2.twinx()
-        ax2_right.plot(ep_range, history["offset_epe"], "d-", label="Offset EPE (px)", color="darkorange")
-        ax2_right.set_ylabel("EPE (pixels)", color="darkorange")
 
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Score / IoU")
@@ -176,10 +164,10 @@ def plot_validation_examples(
     """
     Render 4 fixed validation cutouts in a 5-column inspection figure:
     1. Astronomical Stretched RGB (LeakySB)
-    2. Ground Truth Instance Mask
-    3. Predicted Center Heatmap with detected peaks
-    4. Predicted Offset Quiver Vector Field
-    5. Deblended Instances from Center Offset Voting
+    2. Ground Truth Star Instances
+    3. Predicted Star Center Heatmap H_star
+    4. Predicted Spike-Bridging Gate G_fg
+    5. Directly Deblended Star Instances (instance_mask on GPU)
     """
     nrows = min(4, len(fixed_cutouts))
     if nrows == 0:
@@ -196,7 +184,6 @@ def plot_validation_examples(
             raw_arr = fixed_cutouts[i]["raw"]
             gt_inst = fixed_cutouts[i]["target"]
 
-            # GPU stretch
             raw_t = torch.from_numpy(raw_arr).unsqueeze(0).unsqueeze(0).to(device)
             m_in_ch = getattr(model, "in_channels", 3)
             if gpu_transform is not None:
@@ -212,17 +199,14 @@ def plot_validation_examples(
             else:
                 preds = model(img_t)
 
-            p_fg = torch.sigmoid(preds["semantic"][0, 0]).float().cpu().numpy()
-            p_ctr = torch.sigmoid(preds["center"][0, 0]).float().cpu().numpy()
-            pred_off = preds["offset"][0].float().cpu().numpy()
+            h_ctr = preds["H_star"][0, 0].float().cpu().numpy()
+            g_fg = preds["G_fg"][0, 0].float().cpu().numpy()
+            inst_pred = preds["instance_mask"][0].cpu().numpy()
 
             # RGB / 2D for visualization
             vis_arr = img_t[0].permute(1, 2, 0).float().cpu().numpy().clip(0.0, 1.0)
             if vis_arr.shape[-1] == 1:
                 vis_arr = vis_arr.squeeze(-1)
-
-            # Detect peaks
-            peaks = extract_center_peaks(p_ctr, threshold=0.3, min_distance=3)
 
             # Col 1: Stretched Image
             axes[i, 0].imshow(vis_arr, cmap="gray" if vis_arr.ndim == 2 else None)
@@ -232,44 +216,26 @@ def plot_validation_examples(
             # Col 2: Ground Truth Instances
             axes[i, 1].imshow(gt_inst, cmap="gist_ncar", interpolation="nearest")
             n_gt = len(np.unique(gt_inst)[np.unique(gt_inst) > 0])
-            axes[i, 1].set_title(f"GT Instances (N={n_gt})")
+            axes[i, 1].set_title(f"GT Star Instances (N={n_gt})")
             axes[i, 1].axis("off")
 
-            # Col 3: Center Heatmap & Peaks
-            axes[i, 2].imshow(p_ctr, cmap="inferno", vmin=0.0, vmax=1.0)
-            for py, px, sc in peaks:
-                axes[i, 2].plot(px, py, "c+", markersize=10, markeredgewidth=2)
-            axes[i, 2].set_title(f"Pred Centers (N={len(peaks)})")
+            # Col 3: Center Heatmap
+            axes[i, 2].imshow(h_ctr, cmap="inferno", vmin=0.0, vmax=1.0)
+            axes[i, 2].set_title("Star Center Heatmap (H_star)")
             axes[i, 2].axis("off")
 
-            # Col 4: Offset Vector Field (Quiver sampled every 16 px on foreground)
-            axes[i, 3].imshow(p_fg, cmap="Blues", alpha=0.5)
-            step = 16
-            h, w = p_fg.shape
-            yy, xx = np.mgrid[0:h:step, 0:w:step]
-            u = pred_off[1, yy, xx]  # delta_x
-            v = pred_off[0, yy, xx]  # delta_y
-            fg_sub = (p_fg[yy, xx] >= 0.3)
-            axes[i, 3].quiver(
-                xx[fg_sub], yy[fg_sub], u[fg_sub], -v[fg_sub],
-                color="red", scale=250, width=0.005, headwidth=4
-            )
-            axes[i, 3].set_title("Pred Offset Vectors (Δy, Δx)")
+            # Col 4: Spike-Bridging Gate
+            axes[i, 3].imshow(g_fg, cmap="viridis", vmin=0.0, vmax=1.0)
+            axes[i, 3].set_title("Spike-Bridging Gate (G_fg)")
             axes[i, 3].axis("off")
 
-            # Col 5: Reconstructed Instance Voting (direct vectorized deblending from predictions)
-            recon_map, masks, _, _, _, _ = CenterOffsetSegmentor.deblend_from_maps(
-                pred_semantic=p_fg,
-                pred_center=p_ctr,
-                pred_offsets=pred_off,
-                fg_thresh=0.5,
-                center_thresh=0.3,
-            )
-            axes[i, 4].imshow(recon_map, cmap="gist_ncar", interpolation="nearest")
-            axes[i, 4].set_title(f"Deblended (N={len(masks)})")
+            # Col 5: Reconstructed Instance Mask (GPU Direct Assembly)
+            axes[i, 4].imshow(inst_pred, cmap="gist_ncar", interpolation="nearest")
+            n_pred = len(np.unique(inst_pred)[np.unique(inst_pred) > 0])
+            axes[i, 4].set_title(f"Deblended Stars (N={n_pred})")
             axes[i, 4].axis("off")
 
-    fig.suptitle(f"Grace Hopper Center Offset Validation (Epoch {epoch}/{epochs})", fontsize=16)
+    fig.suptitle(f"Grace Hopper SteerQuery Validation (Epoch {epoch}/{epochs})", fontsize=16)
     plt.tight_layout()
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
@@ -278,27 +244,27 @@ def plot_validation_examples(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="NVIDIA Grace Hopper (GH200) Center Offset Voting Training Script for sam2roman."
+        description="NVIDIA Grace Hopper (GH200) SteerQuery Star-Deblending Training Script for sam2roman."
     )
     parser.add_argument("--train_shards", type=str, nargs="+", required=True, help="Train WebDataset shard path pattern.")
     parser.add_argument("--val_shards", type=str, nargs="+", default=None, help="Val WebDataset shard path pattern.")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for checkpoints and curves.")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per training step (default: 16).")
-    parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps (default: 1; use 2 with batch_size 16 for effective batch 32).")
+    parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps (default: 1).")
     parser.add_argument("--epochs", type=int, default=80, help="Total training epochs (default: 80).")
     parser.add_argument("--lr", type=float, default=6e-5, help="Learning rate (default: 6e-5).")
     parser.add_argument("--weight_decay", type=float, default=1e-2, help="Weight decay (default: 1e-2).")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Gradient clipping norm (default: 1.0).")
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["cosine", "none"], dest="scheduler_type")
-    parser.add_argument("--warmup_epochs", type=int, default=3, help="Warmup epochs (default: 3).")
+    parser.add_argument("--warmup_epochs", type=int, default=5, help="Teacher-forcing query warmup epochs (default: 5).")
     parser.add_argument("--num_workers", type=int, default=16, help="DataLoader CPU workers (default: 16 on 72-core GH200).")
-    parser.add_argument("--prefetch_factor", type=int, default=8, help="DataLoader prefetch factor (default: 8 for ring buffer).")
-    parser.add_argument("--use_cca", action="store_true", default=True, help="Enable Recurrent Criss-Cross Attention for spikes.")
-    parser.add_argument("--no_cca", action="store_false", dest="use_cca", help="Disable Criss-Cross Attention.")
-    parser.add_argument("--center_weight", type=float, default=2.0, help="Center heatmap focal loss weight (default: 2.0).")
-    parser.add_argument("--offset_weight", type=float, default=1.0, help="Offset regression Smooth L1 weight (default: 1.0).")
-    parser.add_argument("--angle_weight", type=float, default=0.5, help="Angular cosine loss weight for diffraction spikes (default: 0.5).")
-    parser.add_argument("--center_sigma", type=float, default=2.0, help="Gaussian center peak sigma (default: 2.0).")
+    parser.add_argument("--prefetch_factor", type=int, default=4, help="DataLoader prefetch factor (default: 4 for ring buffer).")
+    parser.add_argument("--sem_weight", type=float, default=1.0, help="Semantic segmentation loss weight (default: 1.0).")
+    parser.add_argument("--center_weight", type=float, default=2.0, help="Star center heatmap focal loss weight (default: 2.0).")
+    parser.add_argument("--gate_weight", type=float, default=1.0, help="Spike-bridging gate loss weight (default: 1.0).")
+    parser.add_argument("--inst_weight", type=float, default=1.0, help="Instance BCE + Dice loss weight (default: 1.0).")
+    parser.add_argument("--proto_dim", type=int, default=32, help="Prototype feature dimension D (default: 32).")
+    parser.add_argument("--n_max", type=int, default=128, help="Maximum number of queries N_max (default: 128).")
     parser.add_argument("--noise_aug", action="store_true", default=True, help="Enable GPU Poisson shot & Gaussian read noise.")
     parser.add_argument("--log_file", type=str, default="epoch_log.txt", help="Log filename inside output_dir.")
     parser.add_argument("--plot_interval", type=int, default=5, help="Epoch interval for visual inspection figures (default: 5).")
@@ -355,22 +321,23 @@ def main():
         },
         aug_kwargs={
             "enable_noise": args.noise_aug,
-            "enable_spatial": False,  # Spatial rotation/flips handled on CPU before offset calculation
+            "enable_spatial": False,
         },
     ).to(device)
 
-    trainer = CenterOffsetTrainer(
+    trainer = SteerQueryTrainer(
         in_channels=3,
-        semantic_classes=1,
+        num_classes=3,
         features=(32, 64, 128, 256, 512),
-        use_cca=args.use_cca,
+        proto_dim=args.proto_dim,
+        N_max=args.n_max,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         grad_clip_norm=args.grad_clip_norm,
+        sem_weight=args.sem_weight,
         center_weight=args.center_weight,
-        offset_weight=args.offset_weight,
-        angle_weight=args.angle_weight,
-        center_sigma=args.center_sigma,
+        gate_weight=args.gate_weight,
+        inst_weight=args.inst_weight,
         gpu_transform=gpu_transform,
         device=device,
     )
@@ -382,7 +349,7 @@ def main():
         if fixed_val_cutouts:
             logger.info(f"Cached {len(fixed_val_cutouts)} fixed cutouts.")
 
-    def epoch_callback(trainer_inst: CenterOffsetTrainer, epoch_data: Dict[str, Any], history: Dict[str, List[float]]) -> None:
+    def epoch_callback(trainer_inst: SteerQueryTrainer, epoch_data: Dict[str, Any], history: Dict[str, List[float]]) -> None:
         epoch = epoch_data["epoch"]
         epochs = epoch_data["epochs"]
         if epoch % args.plot_interval == 0 or epoch == epochs:
@@ -401,7 +368,7 @@ def main():
                     amp_dtype=trainer_inst.amp_dtype,
                 )
 
-    logger.info(f"Starting Grace Hopper training run: batch_size={args.batch_size}, epochs={args.epochs}")
+    logger.info(f"Starting Grace Hopper SteerQuery training: batch_size={args.batch_size}, epochs={args.epochs}")
     t0 = time.time()
 
     history = trainer.train(
@@ -421,7 +388,7 @@ def main():
     )
 
     total_time = time.time() - t0
-    logger.info(f"Grace Hopper Center Offset training finished in {total_time:.1f}s ({total_time / args.epochs:.2f}s/epoch)")
+    logger.info(f"Grace Hopper SteerQuery training finished in {total_time:.1f}s ({total_time / args.epochs:.2f}s/epoch)")
     plot_training_curves(history=history, output_dir=output_dir, current_epoch=args.epochs)
 
 
