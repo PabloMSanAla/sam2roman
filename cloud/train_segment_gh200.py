@@ -326,6 +326,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    # Raise open file descriptor limits and use file_system IPC sharing strategy
+    # to protect against Linux IPC exhaustion with large worker counts
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 65536), hard))
+    except Exception:
+        pass
+
+    try:
+        import torch.multiprocessing as mp
+        mp.set_sharing_strategy("file_system")
+    except Exception:
+        pass
+
     parser = build_parser()
     args = parser.parse_args()
 

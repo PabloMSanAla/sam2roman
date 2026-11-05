@@ -187,7 +187,15 @@ def create_webdataset_loader(
 
     if effective_workers > 0:
         loader_kwargs["persistent_workers"] = True if persistent_workers is None else persistent_workers
-        loader_kwargs["prefetch_factor"] = 2 if prefetch_factor is None else prefetch_factor
+        pf = 2 if prefetch_factor is None else prefetch_factor
+        if pf > 4:
+            logger.warning(
+                f"[sam2roman] prefetch_factor={pf} with {effective_workers} workers creates {effective_workers * pf} "
+                f"queued batches in shared memory, risking Linux IPC file descriptor exhaustion / SIGABRT. "
+                f"Capping prefetch_factor to 4."
+            )
+            pf = 4
+        loader_kwargs["prefetch_factor"] = pf
 
     loader = DataLoader(pipeline, **loader_kwargs)
 

@@ -55,6 +55,9 @@ else
 fi
 
 # 3. Launch GH200 SteerQuery Star-Deblending Training
+# Increase open file descriptor limits for PyTorch multiprocessing IPC
+ulimit -n 65536
+
 # batch_size=16 (fits safely within ~28 GB VRAM); grad_accum_steps=2 yields effective batch size 32.
 $PYTHON_BIN /nobackup/pmsanch1/code/sam2roman/cloud/train_segment_gh200.py \
     --train_shards "$TRAIN_SHARDS" \
