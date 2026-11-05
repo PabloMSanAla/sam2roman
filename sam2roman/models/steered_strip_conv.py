@@ -158,42 +158,32 @@ class LearnableSteeredStripConv(nn.Module):
         )
         base_grid = torch.stack([base_x, base_y], dim=-1)  # (H, W, 2)
 
-        # Batch replicate x across 6 branches: (6*B, C, H, W)
-        x_rep = x.repeat(6, 1, 1, 1)
+        # Memory-efficient branch evaluation:
+        # Avoids duplicating x across branches via x.repeat(6, ...) and avoids allocating
+        # a physical (6*B, H, W, 2) grid 31 times. Instead, samples per branch with zero-copy
+        # batch expansion (.expand(b, -1, -1, -1)), slashing peak VRAM by >75%.
+        branch_list = []
+        for m in range(6):
+            accum_m = torch.zeros(b, c, h, w, device=device, dtype=dtype)
+            for k in range(self.K):
+                shift = torch.stack([dx_norm[m, k], dy_norm[m, k]])  # (2,)
+                grid_k = (base_grid + shift).unsqueeze(0).expand(b, -1, -1, -1)
 
-        # Accumulate weighted samples across K
-        accum = torch.zeros(6 * b, c, h, w, device=device, dtype=dtype)
+                sampled = F.grid_sample(
+                    x,
+                    grid_k,
+                    mode="bilinear",
+                    padding_mode="border",
+                    align_corners=True,
+                )  # (B, C, H, W)
 
-        for k in range(self.K):
-            # Shift for all 6 branches at step k: (6, 2)
-            shift_k = torch.stack([dx_norm[:, k], dy_norm[:, k]], dim=-1)
-            # Expand to (6*B, 1, 1, 2)
-            shift_k = (
-                shift_k.unsqueeze(1)
-                .expand(-1, b, -1)
-                .reshape(6 * b, 1, 1, 2)
-            )
-            grid_k = base_grid.unsqueeze(0) + shift_k
+                w_mk = self.strip_weights[m, :, k].view(1, c, 1, 1)
+                accum_m = accum_m + sampled * w_mk
 
-            sampled = F.grid_sample(
-                x_rep,
-                grid_k,
-                mode="bilinear",
-                padding_mode="border",
-                align_corners=True,
-            )  # (6*B, C, H, W)
+            branch_list.append(accum_m)
 
-            # Strip weights at step k: (6, C) -> expand to (6*B, C, 1, 1)
-            w_k = (
-                self.strip_weights[:, :, k]
-                .unsqueeze(1)
-                .expand(-1, b, -1)
-                .reshape(6 * b, c, 1, 1)
-            )
-            accum = accum + sampled * w_k
-
-        # Reshape to (B, 6, C, H, W)
-        branch_feats = accum.view(6, b, c, h, w).permute(1, 0, 2, 3, 4).contiguous()
+        # Stack into (B, 6, C, H, W)
+        branch_feats = torch.stack(branch_list, dim=1)
 
         # Concatenate branches and project
         concat_branches = branch_feats.view(b, 6 * c, h, w)

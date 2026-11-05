@@ -132,10 +132,21 @@ class SteeredPrototypeNeck(nn.Module):
         device = F_dec.device
         dtype = F_dec.dtype
 
-        # 1. Multi-dilation cascade
-        x1, theta_m, branch_feats1 = self.strip1(F_dec)
-        x2, _, _ = self.strip2(x1)
-        x3, _, _ = self.strip3(x2)
+        # 1. Multi-dilation cascade with gradient checkpointing during training
+        if self.training and F_dec.requires_grad:
+            x1, theta_m, branch_feats1 = torch.utils.checkpoint.checkpoint(
+                self.strip1, F_dec, use_reentrant=False
+            )
+            x2, _, _ = torch.utils.checkpoint.checkpoint(
+                self.strip2, x1, use_reentrant=False
+            )
+            x3, _, _ = torch.utils.checkpoint.checkpoint(
+                self.strip3, x2, use_reentrant=False
+            )
+        else:
+            x1, theta_m, branch_feats1 = self.strip1(F_dec)
+            x2, _, _ = self.strip2(x1)
+            x3, _, _ = self.strip3(x2)
 
         # 2. Normalized pixel coordinate grid in [-1, 1]
         gy, gx = torch.meshgrid(
@@ -605,15 +616,16 @@ class SteerQueryHead(nn.Module):
         # Zero out invalid padded queries
         M_inst = M_inst * valid_mask.view(b, self.N_max, 1, 1).float()
 
-        # Weight by detection confidence
-        M_scored = M_inst * scores.view(b, self.N_max, 1, 1)
+        # Weight by detection confidence (no autograd needed for integer mask assembly)
+        with torch.no_grad():
+            M_scored = M_inst.detach() * scores.detach().view(b, self.N_max, 1, 1)
 
-        # Prepend background channel 0 filled with threshold tau_mask
-        bg = torch.full((b, 1, h, w), self.tau_mask, device=device, dtype=dtype)
-        scored_with_bg = torch.cat([bg, M_scored], dim=1)  # (B, N + 1, H, W)
+            # Prepend background channel 0 filled with threshold tau_mask
+            bg = torch.full((b, 1, h, w), self.tau_mask, device=device, dtype=dtype)
+            scored_with_bg = torch.cat([bg, M_scored], dim=1)  # (B, N + 1, H, W)
 
-        # Argmax assembly: 0 is background / galaxy, 1..N are unique star instances
-        instance_mask = torch.argmax(scored_with_bg, dim=1).to(torch.int32)
+            # Argmax assembly: 0 is background / galaxy, 1..N are unique star instances
+            instance_mask = torch.argmax(scored_with_bg, dim=1).to(torch.int32)
 
         return {
             "instance_mask": instance_mask,

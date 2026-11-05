@@ -319,18 +319,30 @@ class SteerQueryLoss(nn.Module):
                 matched_weights.append(w_pix[i, 0])
 
         if len(matched_preds) > 0:
-            m_preds = torch.stack(matched_preds, dim=0)
-            m_targets = torch.stack(matched_targets, dim=0)
-            m_weights = torch.stack(matched_weights, dim=0)
+            # Chunked evaluation (slices of 32 stars) avoids allocating multi-gigabyte
+            # tensors when hundreds of stars are matched across crowded fields
+            chunk_size = 32
+            num_matched = len(matched_preds)
+            total_bce = 0.0
+            total_dice = 0.0
 
-            # Batched weighted BCE and Soft Dice across all matched stars
-            bce = F.binary_cross_entropy(
-                m_preds.clamp(self.eps, 1.0 - self.eps), m_targets, weight=m_weights, reduction="mean"
-            )
-            inter = (m_preds * m_targets).sum(dim=(1, 2))
-            denom = m_preds.sum(dim=(1, 2)) + m_targets.sum(dim=(1, 2))
-            dice = 1.0 - (2.0 * inter + self.eps) / (denom + self.eps)
-            l_inst = bce + dice.mean()
+            for c_start in range(0, num_matched, chunk_size):
+                c_end = min(c_start + chunk_size, num_matched)
+                c_preds = torch.stack(matched_preds[c_start:c_end], dim=0)
+                c_targets = torch.stack(matched_targets[c_start:c_end], dim=0)
+                c_weights = torch.stack(matched_weights[c_start:c_end], dim=0)
+
+                bce_c = F.binary_cross_entropy(
+                    c_preds.clamp(self.eps, 1.0 - self.eps), c_targets, weight=c_weights, reduction="sum"
+                )
+                inter_c = (c_preds * c_targets).sum(dim=(1, 2))
+                denom_c = c_preds.sum(dim=(1, 2)) + c_targets.sum(dim=(1, 2))
+                dice_c = (1.0 - (2.0 * inter_c + self.eps) / (denom_c + self.eps)).sum()
+
+                total_bce = total_bce + bce_c
+                total_dice = total_dice + dice_c
+
+            l_inst = (total_bce / (num_matched * h * w)) + (total_dice / num_matched)
         else:
             l_inst = torch.tensor(0.0, device=device)
 

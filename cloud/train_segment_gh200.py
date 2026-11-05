@@ -108,6 +108,8 @@ def extract_crowded_val_cutouts(
                         }
                     ))
                     scanned += 1
+                    if scanned % 20 == 0 or scanned == max_scan:
+                        logger.info(f"Scanned {scanned}/{max_scan} validation cutouts...")
                     if scanned >= max_scan:
                         break
         except Exception as e:
@@ -404,7 +406,7 @@ def main():
     val_cutout_pool = None
     if val_shards:
         logger.info("Scanning validation shards for crowded cutouts pool...")
-        val_cutout_pool = extract_crowded_val_cutouts(val_shards, pool_size=32, max_scan=150)
+        val_cutout_pool = extract_crowded_val_cutouts(val_shards, pool_size=16, max_scan=60)
         if val_cutout_pool:
             star_counts = [c.get("n_stars", 0) for c in val_cutout_pool]
             logger.info(
