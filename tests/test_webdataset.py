@@ -170,6 +170,59 @@ def test_gpu_astro_augmentation():
     assert torch.allclose(eval_target, target)
 
 
+def test_gpu_astro_gradient_tilted_plane():
+    """Verify tilted plane background gradient with center at 0 and variable sigma."""
+    aug = GPUAstroAugmentation(
+        enable_noise=True,
+        enable_spatial=False,
+        shot_noise_prob=0.0,
+        read_noise_prob=0.0,
+        sky_pedestal_prob=0.0,
+        flux_scale_prob=0.0,
+        gradient_prob=1.0,
+        gradient_sigma_range=(2.0, 5.0),
+    )
+    aug.train()
+
+    # Odd spatial dimensions so (32, 32) is exact center
+    raw = torch.zeros((2, 1, 65, 65), dtype=torch.float32)
+    aug_raw, _ = aug(raw, None)
+
+    # Center pixel must be 0.0 (tilted plane centered at 0)
+    center_val = aug_raw[:, 0, 32, 32]
+    assert torch.allclose(center_val, torch.zeros_like(center_val), atol=1e-5)
+
+    # Edge pixels must have non-zero gradient values
+    assert not torch.allclose(aug_raw, raw)
+    assert aug_raw[:, 0, 0, 0].abs().sum() > 0.0
+
+
+def test_gpu_leaky_sb_magnitude_jitter():
+    """Verify mmin and mmax jitter during training vs deterministic eval mode."""
+    gpu_module = GPULeakySB(
+        zero_points=31.4,
+        pixel_scale=0.11,
+        mmin=13.0,
+        mmax=32.0,
+        mmin_jitter=2.0,
+        mmax_jitter=2.0,
+        out_channels=3,
+    )
+    raw = torch.full((4, 1, 64, 64), 100.0, dtype=torch.float32)
+
+    # In training mode, jitter produces different stretches across samples
+    gpu_module.train()
+    out1 = gpu_module(raw)
+    out2 = gpu_module(raw)
+    assert not torch.allclose(out1, out2)
+
+    # In eval mode, stretch is deterministic and uses nominal mmin/mmax
+    gpu_module.eval()
+    eval_out1 = gpu_module(raw)
+    eval_out2 = gpu_module(raw)
+    assert torch.allclose(eval_out1, eval_out2)
+
+
 def test_unetpp_webdataset_end_to_end(synthetic_fits_dir, tmp_path):
     """Verify UNetPPTrainer trains end-to-end on WebDataset shards with GPU transforms."""
     images_dir, masks_dir = synthetic_fits_dir

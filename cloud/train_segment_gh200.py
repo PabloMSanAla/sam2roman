@@ -266,6 +266,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proto_dim", type=int, default=32, help="Prototype feature dimension D (default: 32).")
     parser.add_argument("--n_max", type=int, default=128, help="Maximum number of queries N_max (default: 128).")
     parser.add_argument("--noise_aug", action="store_true", default=True, help="Enable GPU Poisson shot & Gaussian read noise.")
+    parser.add_argument("--mmin_jitter", type=float, default=1.5, help="Magnitude jitter for mmin in LeakySB (default: 1.5 mag).")
+    parser.add_argument("--mmax_jitter", type=float, default=1.5, help="Magnitude jitter for mmax in LeakySB (default: 1.5 mag).")
+    parser.add_argument("--gradient_prob", type=float, default=0.5, help="Probability of applying tilted-plane background gradient (default: 0.5).")
+    parser.add_argument("--gradient_sigma_max", type=float, default=4.0, help="Max sigma for tilted plane gradient in DN (default: 4.0).")
     parser.add_argument("--log_file", type=str, default="epoch_log.txt", help="Log filename inside output_dir.")
     parser.add_argument("--plot_interval", type=int, default=5, help="Epoch interval for visual inspection figures (default: 5).")
     return parser
@@ -317,11 +321,15 @@ def main():
             "pixel_scale": 0.11,
             "mmin": 13.0,
             "mmax": 32.0,
+            "mmin_jitter": args.mmin_jitter if args.noise_aug else 0.0,
+            "mmax_jitter": args.mmax_jitter if args.noise_aug else 0.0,
             "out_channels": 3,
         },
         aug_kwargs={
             "enable_noise": args.noise_aug,
             "enable_spatial": False,
+            "gradient_prob": args.gradient_prob if args.noise_aug else 0.0,
+            "gradient_sigma_range": (0.5, args.gradient_sigma_max),
         },
     ).to(device)
 

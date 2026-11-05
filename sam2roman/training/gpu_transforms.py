@@ -53,6 +53,8 @@ class GPULeakySB(nn.Module):
         pixel_scale: float = 0.11,
         mmin: float = 13.0,
         mmax: float = 32.0,
+        mmin_jitter: float = 0.0,
+        mmax_jitter: float = 0.0,
         negative_slope: float = 0.1,
         positive_slope: float = 0.05,
         y_zero: float = 0.015,
@@ -64,6 +66,8 @@ class GPULeakySB(nn.Module):
         self.pixel_scale = float(pixel_scale)
         self.mmin = float(mmin)
         self.mmax = float(mmax)
+        self.mmin_jitter = float(mmin_jitter)
+        self.mmax_jitter = float(mmax_jitter)
         self.negative_slope = float(negative_slope)
         self.positive_slope = float(positive_slope)
         self.y_zero = float(y_zero)
@@ -103,23 +107,42 @@ class GPULeakySB(nn.Module):
             fill_val = torch.median(x[finite_mask]) if finite_mask.any() else torch.tensor(0.0, device=x.device, dtype=x.dtype)
             x = torch.where(finite_mask, x, fill_val)
 
+        b = x.shape[0]
+
+        # Apply slight magnitude stretch jitter in training mode if enabled
+        if self.training and (self.mmin_jitter > 0.0 or self.mmax_jitter > 0.0):
+            dm_min = (torch.rand((b, 1, 1, 1), device=x.device, dtype=x.dtype) * 2.0 - 1.0) * self.mmin_jitter
+            dm_max = (torch.rand((b, 1, 1, 1), device=x.device, dtype=x.dtype) * 2.0 - 1.0) * self.mmax_jitter
+            eff_mmin = self.mmin + dm_min
+            eff_mmax = self.mmax + dm_max
+            span = torch.clamp(eff_mmax - eff_mmin, min=5.0)
+            f_mmax = (self.pixel_scale ** 2) * (10.0 ** (0.4 * (self.zero_points - eff_mmax)))
+            k_tangent = (2.5 / math.log(10.0)) / span
+            s_neg = (self.negative_slope * k_tangent * self.mid_span) / max(self.y_zero, 1e-8)
+            s_pos = self.s_pos
+        else:
+            span = self.span
+            f_mmax = self.f_mmax
+            s_neg = self.s_neg
+            s_pos = self.s_pos
+
         # Normalize relative to faint magnitude limit f_mmax
-        f_norm = x / self.f_mmax
+        f_norm = x / f_mmax
 
         # Log regime for f_norm >= 1.0
         f_safe = torch.clamp(f_norm, min=1.0)
-        u = (2.5 * torch.log10(f_safe)) / self.span
+        u = (2.5 * torch.log10(f_safe)) / span
 
         y_mid = self.y_zero + self.mid_span * u
 
         # Core saturation regime (u > 1.0)
         u_excess = torch.clamp(u - 1.0, min=0.0)
-        y_high = 1.0 - (self.top_room / (1.0 + self.s_pos * u_excess))
+        y_high = 1.0 - (self.top_room / (1.0 + s_pos * u_excess))
         y_pos = torch.where(u <= 1.0, y_mid, y_high)
 
         # Negative & sub-sky background regime (f_norm < 1.0)
         f_deficit = torch.clamp(1.0 - f_norm, min=0.0)
-        y_low = self.y_zero / (1.0 + self.s_neg * f_deficit)
+        y_low = self.y_zero / (1.0 + s_neg * f_deficit)
 
         stretched = torch.where(f_norm >= 1.0, y_pos, y_low)
         stretched = torch.clamp(stretched, 0.0, 1.0)
@@ -175,6 +198,8 @@ class GPUAstroAugmentation(nn.Module):
         read_noise_prob: float = 0.5,
         sky_pedestal_std: float = 3.0,
         sky_pedestal_prob: float = 0.5,
+        gradient_prob: float = 0.5,
+        gradient_sigma_range: Tuple[float, float] = (0.5, 4.0),
         flux_scale_range: Tuple[float, float] = (0.9, 1.1),
         flux_scale_prob: float = 0.5,
         rot_prob: float = 0.5,
@@ -190,6 +215,8 @@ class GPUAstroAugmentation(nn.Module):
         self.read_noise_prob = read_noise_prob
         self.sky_pedestal_std = sky_pedestal_std
         self.sky_pedestal_prob = sky_pedestal_prob
+        self.gradient_prob = gradient_prob
+        self.gradient_sigma_range = gradient_sigma_range
         self.flux_scale_range = flux_scale_range
         self.flux_scale_prob = flux_scale_prob
         self.rot_prob = rot_prob
@@ -241,12 +268,33 @@ class GPUAstroAugmentation(nn.Module):
 
             # C. Sky Pedestal Shifts (simulates varying sky subtraction residuals)
             if self.sky_pedestal_prob > 0 and torch.rand(1, device=raw.device).item() < self.sky_pedestal_prob:
-                pedestal = torch.randn((b, 1, 1, 1), device=raw.device) * self.sky_pedestal_std
+                pedestal = torch.randn((b, 1, 1, 1), device=raw.device, dtype=raw.dtype) * self.sky_pedestal_std
                 if aug_raw.ndim == 3:
                     pedestal = pedestal.squeeze(1)
                 aug_raw = aug_raw + pedestal
 
-            # D. Photometric Scaling Jitter (zeropoint calibration variations)
+            # D. Sky Gradient Shifts: Tilted planes centered at 0 with variable sigma
+            if self.gradient_prob > 0 and torch.rand(1, device=raw.device).item() < self.gradient_prob:
+                # Normalized grid centered at 0 in [-1.0, 1.0]
+                ys = torch.linspace(-1.0, 1.0, h, device=raw.device, dtype=raw.dtype)
+                xs = torch.linspace(-1.0, 1.0, w, device=raw.device, dtype=raw.dtype)
+                grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+
+                # Sample variable standard deviation per sample
+                sig_low, sig_high = self.gradient_sigma_range
+                sigmas = torch.empty((b, 1, 1, 1), device=raw.device, dtype=raw.dtype).uniform_(sig_low, sig_high)
+
+                # Random slopes along x and y with sampled sigma
+                slope_x = torch.randn((b, 1, 1, 1), device=raw.device, dtype=raw.dtype) * sigmas
+                slope_y = torch.randn((b, 1, 1, 1), device=raw.device, dtype=raw.dtype) * sigmas
+
+                # Tilted plane: P(0,0) = 0 at cutout center
+                tilted_plane = slope_x * grid_x.view(1, 1, h, w) + slope_y * grid_y.view(1, 1, h, w)
+                if aug_raw.ndim == 3:
+                    tilted_plane = tilted_plane.squeeze(1)
+                aug_raw = aug_raw + tilted_plane
+
+            # E. Photometric Scaling Jitter (zeropoint calibration variations)
             if self.flux_scale_prob > 0 and torch.rand(1, device=raw.device).item() < self.flux_scale_prob:
                 scale_low, scale_high = self.flux_scale_range
                 scale_factor = torch.empty((b, 1, 1, 1), device=raw.device).uniform_(scale_low, scale_high)

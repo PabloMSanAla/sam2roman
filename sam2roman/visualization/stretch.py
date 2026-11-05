@@ -135,7 +135,7 @@ def leakySB(
     g: ArrayOrTensor,
     b: ArrayOrTensor,
     zero_points: float | Sequence[float] = 31.4,
-    pixel_scale: float | Sequence[float] = 0.262,
+    pixel_scale: float | Sequence[float] = 0.11,
     mmin: float = 13.0,
     mmax: float = 32.0,
     negative_slope: float = 0.1,
@@ -213,7 +213,7 @@ def leakySB(
 def leakySB_inverse(
     rgb: ArrayOrTensor,
     zero_points: float | Sequence[float] = 31.4,
-    pixel_scale: float | Sequence[float] = 0.262,
+    pixel_scale: float | Sequence[float] = 0.11,
     mmin: float = 13.0,
     mmax: float = 32.0,
     negative_slope: float = 0.1,
