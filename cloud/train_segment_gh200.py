@@ -30,6 +30,8 @@ for candidate in [Path(__file__).resolve().parent.parent, Path.cwd()]:
     if (candidate / "sam2roman").exists() and str(candidate) not in sys.path:
         sys.path.insert(0, str(candidate))
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch

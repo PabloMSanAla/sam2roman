@@ -186,7 +186,7 @@ def create_webdataset_loader(
     }
 
     if effective_workers > 0:
-        loader_kwargs["persistent_workers"] = True if persistent_workers is None else persistent_workers
+        loader_kwargs["persistent_workers"] = False if persistent_workers is None else persistent_workers
         pf = 2 if prefetch_factor is None else prefetch_factor
         if pf > 4:
             logger.warning(

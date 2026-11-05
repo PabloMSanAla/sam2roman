@@ -67,8 +67,8 @@ $PYTHON_BIN /nobackup/pmsanch1/code/sam2roman/cloud/train_segment_gh200.py \
     --grad_accum_steps 2 \
     --epochs 80 \
     --lr 6e-5 \
-    --num_workers 27 \
-    --prefetch_factor 4 \
+    --num_workers 16 \
+    --prefetch_factor 2 \
     --sem_weight 1.0 \
     --center_weight 2.0 \
     --gate_weight 1.0 \

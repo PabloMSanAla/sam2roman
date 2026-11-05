@@ -391,7 +391,7 @@ class SteerQueryTrainer:
                 is_train=True,
                 num_workers=num_workers,
                 prefetch_factor=prefetch_factor,
-                persistent_workers=True if num_workers > 0 else False,
+                persistent_workers=False,
             )
         elif isinstance(dataset, DataLoader):
             train_loader = dataset
@@ -413,7 +413,7 @@ class SteerQueryTrainer:
                     is_train=False,
                     num_workers=max(1, num_workers // 2),
                     prefetch_factor=prefetch_factor,
-                    persistent_workers=True if num_workers > 0 else False,
+                    persistent_workers=False,
                 )
             elif isinstance(val_dataset, DataLoader):
                 val_loader = val_dataset
