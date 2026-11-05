@@ -167,18 +167,23 @@ class SteerQueryTrainer:
         self, batch: Dict[str, Any]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[List[Tuple[float, float]]]]:
         """Extract and prepare images, instance ground truth, semantics, and centroids."""
+        inst_gt = batch["target"].to(self.device, non_blocking=True).int() if "target" in batch else None
+
         if "image" in batch:
             images = batch["image"].to(self.device, non_blocking=True)
         elif "raw" in batch:
             raw = batch["raw"].to(self.device, non_blocking=True)
             if self.gpu_transform is not None:
-                images, _ = self.gpu_transform(raw, None)
+                images, aug_target = self.gpu_transform(raw, inst_gt)
+                if aug_target is not None:
+                    inst_gt = aug_target.int()
             else:
                 images = raw
         else:
             raise KeyError(f"Expected 'image' or 'raw' in batch, got {list(batch.keys())}")
 
-        inst_gt = batch["target"].to(self.device, non_blocking=True).int()
+        if inst_gt is None:
+            raise KeyError("Expected 'target' in batch for instance segmentation ground truth")
 
         if "semantic" in batch:
             sem_gt = batch["semantic"].to(self.device, non_blocking=True).long()
