@@ -1,13 +1,13 @@
 #PBS -S /bin/bash
-#PBS -N sam2roman_segment_gh200
+#PBS -N sam2roman_steer_query_gh200
 #PBS -l select=1:ncpus=72:mpiprocs=1:model=gh200
 #PBS -l walltime=04:00:00
 #PBS -q gpu_normal
 #PBS -j oe
 #PBS -W group_list=s3371
-#PBS -o /nobackup/pmsanch1/segment_training.log
+#PBS -o /nobackup/pmsanch1/steer_query_training.log
 # ==============================================================================
-# NASA HECC Grace Hopper (GH200) Batch Training Job: Center Offset Voting
+# NASA HECC Grace Hopper (GH200) Batch Training Job: SteerQuery Star-Deblending UNet++
 # Reference: https://www.nas.nasa.gov/hecc/support/kb/machine-learning-overview_572.html
 # ==============================================================================
 
@@ -70,10 +70,15 @@ $PYTHON_BIN /nobackup/pmsanch1/code/sam2roman/cloud/train_segment_gh200.py \
     --center_weight 2.0 \
     --gate_weight 1.0 \
     --inst_weight 1.0 \
+    --proto_dim 32 \
+    --n_max 128 \
+    --noise_aug \
+    --mmin_jitter 1.5 \
+    --mmax_jitter 1.5 \
+    --gradient_prob 0.5 \
+    --gradient_sigma_max 4.0 \
     --warmup_epochs 5 \
     --scheduler cosine \
-    --plot_interval 5
-    --scheduler cosine --warmup_epochs 3 \
     --plot_interval 5
 
 echo "================================================================="
