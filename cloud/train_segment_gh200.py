@@ -322,8 +322,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mmax_jitter", type=float, default=1.5, help="Magnitude jitter for mmax in LeakySB (default: 1.5 mag).")
     parser.add_argument("--gradient_prob", type=float, default=0.5, help="Probability of applying tilted-plane background gradient (default: 0.5).")
     parser.add_argument("--gradient_sigma_max", type=float, default=4.0, help="Max sigma for tilted plane gradient in DN (default: 4.0).")
-    parser.add_argument("--log_file", type=str, default="epoch_log.txt", help="Log filename inside output_dir.")
-    parser.add_argument("--log_interval", type=int, default=25, help="Step interval for batch-level progress logging (default: 25).")
+    parser.add_argument("--log_file", type=str, default="epoch_log.txt", help="Log filename for epoch summaries inside output_dir.")
+    parser.add_argument("--step_log_file", type=str, default="iteration_log.txt", help="Log filename for iteration steps inside output_dir.")
+    parser.add_argument("--log_interval", type=int, default=5, help="Step interval for iteration logging (default: 5 steps).")
     parser.add_argument("--max_val_batches", type=int, default=None, help="Maximum validation batches per epoch (default: None, evaluate all).")
     parser.add_argument("--plot_interval", type=int, default=5, help="Epoch interval for visual inspection figures (default: 5).")
     return parser
@@ -468,6 +469,7 @@ def main():
         max_val_batches=args.max_val_batches,
         output_dir=output_dir,
         log_file=args.log_file,
+        step_log_file=args.step_log_file,
         epoch_callback=epoch_callback,
         verbose=True,
     )

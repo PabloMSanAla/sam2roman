@@ -58,17 +58,18 @@ fi
 # Increase open file descriptor limits for PyTorch multiprocessing IPC
 ulimit -n 65536
 
-# batch_size=16 (fits safely within ~28 GB VRAM); grad_accum_steps=2 yields effective batch size 32.
+# batch_size=5 (fits comfortably within ~75 GB VRAM on 96 GB GH200); grad_accum_steps=2 yields effective batch size 10.
 $PYTHON_BIN /nobackup/pmsanch1/code/sam2roman/cloud/train_segment_gh200.py \
     --train_shards "$TRAIN_SHARDS" \
     --val_shards "$VAL_SHARDS" \
     --output_dir /nobackup/pmsanch1/experiments/steer_query_gh200_80epochs \
-    --batch_size 16 \
+    --batch_size 5 \
     --grad_accum_steps 2 \
     --epochs 80 \
     --lr 6e-5 \
-    --num_workers 16 \
+    --num_workers 8 \
     --prefetch_factor 2 \
+    --log_interval 5 \
     --sem_weight 1.0 \
     --center_weight 2.0 \
     --gate_weight 1.0 \

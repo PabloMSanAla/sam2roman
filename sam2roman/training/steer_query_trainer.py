@@ -222,7 +222,8 @@ class SteerQueryTrainer:
         use_teacher_forcing: bool = False,
         epoch: int = 1,
         total_epochs: int = 1,
-        log_interval: int = 25,
+        log_interval: int = 5,
+        step_log_fp: Optional[Path] = None,
     ) -> Dict[str, float]:
         """Execute one training epoch with zero host-device synchronization stalls."""
         self.model.train()
@@ -287,14 +288,22 @@ class SteerQueryTrainer:
                 step_speed = log_interval / max(1e-5, elapsed)
                 sec_per_step = elapsed / log_interval
                 running_loss = float((loss * grad_accum_steps).item())
-                logger.info(
-                    f"  [Epoch {epoch:03d}/{total_epochs:03d}] Step {batch_idx + 1:4d} | "
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                step_msg = (
+                    f"Epoch {epoch:03d}/{total_epochs:03d} | Step {batch_idx + 1:5d} | "
                     f"Loss: {running_loss:.4f} (sem: {loss_dict['sem_loss'].item():.3f}, "
                     f"ctr: {loss_dict['center_loss'].item():.3f}, "
                     f"gate: {loss_dict['gate_loss'].item():.3f}, "
                     f"inst: {loss_dict['inst_loss'].item():.3f}) | "
-                    f"{step_speed:.2f} batch/s ({sec_per_step:.2f}s/batch)"
+                    f"{step_speed:.2f} batch/s ({sec_per_step:.2f}s/batch) | "
+                    f"LR: {current_lr:.2e}"
                 )
+                logger.info(f"  {step_msg}")
+                if step_log_fp is not None:
+                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                    with open(step_log_fp, "a") as f_step:
+                        f_step.write(f"[{timestamp}] {step_msg}\n")
+                        f_step.flush()
                 t_batch_start = time.time()
 
         if steps > 0 and (steps % grad_accum_steps) != 0:
@@ -410,10 +419,11 @@ class SteerQueryTrainer:
         warmup_epochs: int = 5,
         num_workers: int = 16,
         prefetch_factor: int = 4,
-        log_interval: int = 25,
+        log_interval: int = 5,
         max_val_batches: Optional[int] = None,
         output_dir: Optional[Union[str, Path]] = None,
         log_file: Optional[str] = "epoch_log.txt",
+        step_log_file: Optional[str] = "iteration_log.txt",
         epoch_callback: Optional[Callable[[Any, Dict[str, Any], Dict[str, List[float]]], None]] = None,
         verbose: bool = True,
     ) -> Dict[str, List[float]]:
@@ -478,6 +488,7 @@ class SteerQueryTrainer:
         out_path = Path(output_dir) if output_dir else Path("checkpoints")
         out_path.mkdir(parents=True, exist_ok=True)
         log_fp = (out_path / log_file) if log_file else None
+        step_log_fp = (out_path / step_log_file) if step_log_file else None
 
         history: Dict[str, List[float]] = {
             "loss": [],
@@ -493,6 +504,10 @@ class SteerQueryTrainer:
 
         best_val_loss = float("inf")
         logger.info(f"Beginning SteerQuery UNet++ training: {epochs} epochs, batch_size={batch_size}")
+        if log_fp:
+            logger.info(f"  -> Epoch summary log: {log_fp}")
+        if step_log_fp:
+            logger.info(f"  -> Iteration step log (every {log_interval} steps): {step_log_fp}")
 
         for epoch in range(1, epochs + 1):
             t0 = time.time()
@@ -506,6 +521,7 @@ class SteerQueryTrainer:
                 epoch=epoch,
                 total_epochs=epochs,
                 log_interval=log_interval,
+                step_log_fp=step_log_fp,
             )
 
             val_metrics: Dict[str, float] = {}
