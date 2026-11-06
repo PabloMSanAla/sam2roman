@@ -317,17 +317,30 @@ class StarCenterQuerySelector(nn.Module):
 
             for i in range(b):
                 c_img = H_star[i, 0]
-                if len(gt_centroids) > i and len(gt_centroids[i]) > 0:
-                    pts = gt_centroids[i][: self.N_max]
+                raw_pts = gt_centroids[i] if len(gt_centroids) > i and gt_centroids[i] else []
+                # Filter to strictly finite and in-bounds coordinates
+                pts = [
+                    (float(p[0]), float(p[1]))
+                    for p in raw_pts
+                    if 0 <= p[0] < w and 0 <= p[1] < h and math.isfinite(p[0]) and math.isfinite(p[1])
+                ][: self.N_max]
+
+                if len(pts) > 0:
                     cx_t = torch.tensor([p[0] for p in pts], device=device, dtype=dtype)
                     cy_t = torch.tensor([p[1] for p in pts], device=device, dtype=dtype)
                     if self.training:
                         cx_t = cx_t + torch.randn_like(cx_t) * 0.5
                         cy_t = cy_t + torch.randn_like(cy_t) * 0.5
-                    cx_t = cx_t.clamp(0, w - 1)
-                    cy_t = cy_t.clamp(0, h - 1)
 
-                    sc_vals = c_img[cy_t.long(), cx_t.long()]
+                    # Sanitize any NaNs and strictly clamp to [0, dim - 1]
+                    cx_t = torch.nan_to_num(cx_t, nan=0.0).clamp(0.0, float(w - 1))
+                    cy_t = torch.nan_to_num(cy_t, nan=0.0).clamp(0.0, float(h - 1))
+
+                    # Safely sample heatmap values using strictly clamped integer indices
+                    ix = cx_t.round().long().clamp(0, w - 1)
+                    iy = cy_t.round().long().clamp(0, h - 1)
+                    sc_vals = c_img[iy, ix]
+
                     k_valid = len(pts)
                     xy = torch.stack([cx_t, cy_t], dim=-1)
                     val_mask = torch.ones(k_valid, device=device, dtype=torch.bool)

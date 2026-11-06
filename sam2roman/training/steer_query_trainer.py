@@ -196,7 +196,15 @@ class SteerQueryTrainer:
             has_centroids = True
             for m in batch["meta"]:
                 if isinstance(m, dict) and "centroids" in m:
-                    m_list.append([(float(c["cx"]), float(c["cy"])) for c in m["centroids"]])
+                    valid_c = []
+                    for c in m["centroids"]:
+                        try:
+                            fx, fy = float(c["cx"]), float(c["cy"])
+                            if math.isfinite(fx) and math.isfinite(fy):
+                                valid_c.append((fx, fy))
+                        except (ValueError, TypeError, KeyError):
+                            continue
+                    m_list.append(valid_c)
                 else:
                     has_centroids = False
                     break

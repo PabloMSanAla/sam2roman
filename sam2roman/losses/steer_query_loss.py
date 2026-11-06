@@ -62,7 +62,11 @@ def render_star_center_heatmap(
 
     if centroids is not None and len(centroids) == b:
         for i in range(b):
-            pts_i = centroids[i]
+            pts_i = [
+                (float(cx), float(cy))
+                for cx, cy in centroids[i]
+                if 0 <= cx < w and 0 <= cy < h and math.isfinite(cx) and math.isfinite(cy)
+            ]
             batch_centroids.append(pts_i)
             for cx, cy in pts_i:
                 ix = int(round(cx))
