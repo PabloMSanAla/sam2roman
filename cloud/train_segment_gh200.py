@@ -323,23 +323,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient_prob", type=float, default=0.5, help="Probability of applying tilted-plane background gradient (default: 0.5).")
     parser.add_argument("--gradient_sigma_max", type=float, default=4.0, help="Max sigma for tilted plane gradient in DN (default: 4.0).")
     parser.add_argument("--log_file", type=str, default="epoch_log.txt", help="Log filename inside output_dir.")
+    parser.add_argument("--log_interval", type=int, default=25, help="Step interval for batch-level progress logging (default: 25).")
+    parser.add_argument("--max_val_batches", type=int, default=None, help="Maximum validation batches per epoch (default: None, evaluate all).")
     parser.add_argument("--plot_interval", type=int, default=5, help="Epoch interval for visual inspection figures (default: 5).")
     return parser
 
 
 def main():
-    # Raise open file descriptor limits and use file_system IPC sharing strategy
-    # to protect against Linux IPC exhaustion with large worker counts
+    # Raise open file descriptor limits to safely accommodate PyTorch multiprocessing IPC
     try:
         import resource
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 65536), hard))
-    except Exception:
-        pass
-
-    try:
-        import torch.multiprocessing as mp
-        mp.set_sharing_strategy("file_system")
     except Exception:
         pass
 
@@ -469,6 +464,8 @@ def main():
         warmup_epochs=args.warmup_epochs,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
+        log_interval=args.log_interval,
+        max_val_batches=args.max_val_batches,
         output_dir=output_dir,
         log_file=args.log_file,
         epoch_callback=epoch_callback,

@@ -220,6 +220,9 @@ class SteerQueryTrainer:
         dataloader: DataLoader,
         grad_accum_steps: int = 1,
         use_teacher_forcing: bool = False,
+        epoch: int = 1,
+        total_epochs: int = 1,
+        log_interval: int = 25,
     ) -> Dict[str, float]:
         """Execute one training epoch with zero host-device synchronization stalls."""
         self.model.train()
@@ -234,6 +237,7 @@ class SteerQueryTrainer:
         steps = 0
         self.optimizer.zero_grad()
 
+        t_batch_start = time.time()
         for batch_idx, batch in enumerate(dataloader):
             images, inst_gt, sem_gt, H_star_gt, batch_centroids = self._prepare_inputs_and_targets(batch)
             centroids_tf = batch_centroids if use_teacher_forcing else None
@@ -278,6 +282,21 @@ class SteerQueryTrainer:
             total_inst_t += loss_dict["inst_loss"].detach()
             steps += 1
 
+            if log_interval > 0 and (batch_idx + 1) % log_interval == 0:
+                elapsed = time.time() - t_batch_start
+                step_speed = log_interval / max(1e-5, elapsed)
+                sec_per_step = elapsed / log_interval
+                running_loss = float((loss * grad_accum_steps).item())
+                logger.info(
+                    f"  [Epoch {epoch:03d}/{total_epochs:03d}] Step {batch_idx + 1:4d} | "
+                    f"Loss: {running_loss:.4f} (sem: {loss_dict['sem_loss'].item():.3f}, "
+                    f"ctr: {loss_dict['center_loss'].item():.3f}, "
+                    f"gate: {loss_dict['gate_loss'].item():.3f}, "
+                    f"inst: {loss_dict['inst_loss'].item():.3f}) | "
+                    f"{step_speed:.2f} batch/s ({sec_per_step:.2f}s/batch)"
+                )
+                t_batch_start = time.time()
+
         if steps > 0 and (steps % grad_accum_steps) != 0:
             if self.scaler.is_enabled():
                 if self.grad_clip_norm > 0:
@@ -300,7 +319,7 @@ class SteerQueryTrainer:
             "inst_loss": float(total_inst_t.item()) / n,
         }
 
-    def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:
+    def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = None) -> Dict[str, float]:
         """Evaluate validation metrics."""
         self.model.eval()
         if self.gpu_transform is not None:
@@ -312,7 +331,9 @@ class SteerQueryTrainer:
         steps = 0
 
         with torch.no_grad():
-            for batch in dataloader:
+            for batch_idx, batch in enumerate(dataloader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
                 images, inst_gt, sem_gt, H_star_gt, batch_centroids = self._prepare_inputs_and_targets(batch)
 
                 if self.use_amp:
@@ -368,6 +389,8 @@ class SteerQueryTrainer:
 
                 total_star_f1 += f1
                 steps += 1
+                if (batch_idx + 1) % 50 == 0:
+                    logger.info(f"  [Validation] Evaluated {batch_idx + 1} batches...")
 
         n = max(1, steps)
         return {
@@ -387,6 +410,8 @@ class SteerQueryTrainer:
         warmup_epochs: int = 5,
         num_workers: int = 16,
         prefetch_factor: int = 4,
+        log_interval: int = 25,
+        max_val_batches: Optional[int] = None,
         output_dir: Optional[Union[str, Path]] = None,
         log_file: Optional[str] = "epoch_log.txt",
         epoch_callback: Optional[Callable[[Any, Dict[str, Any], Dict[str, List[float]]], None]] = None,
@@ -473,15 +498,19 @@ class SteerQueryTrainer:
             t0 = time.time()
             # Enable teacher forcing during warmup epochs
             use_tf = epoch <= warmup_epochs
+            logger.info(f"=== Starting Epoch {epoch:03d}/{epochs:03d} (Warmup Teacher Forcing: {'ON' if use_tf else 'OFF'}) ===")
             train_metrics = self.train_epoch(
                 train_loader,
                 grad_accum_steps=grad_accum_steps,
                 use_teacher_forcing=use_tf,
+                epoch=epoch,
+                total_epochs=epochs,
+                log_interval=log_interval,
             )
 
             val_metrics: Dict[str, float] = {}
             if val_loader is not None:
-                val_metrics = self.evaluate(val_loader)
+                val_metrics = self.evaluate(val_loader, max_batches=max_val_batches)
 
             current_lr = self.optimizer.param_groups[0]["lr"]
             if scheduler is not None:
